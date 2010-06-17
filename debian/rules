@@ -1,0 +1,37 @@
+#!/usr/bin/make -f
+
+MAKEARGS=DESTDIR=debian/haproxy \
+	 PREFIX=/usr \
+	 IGNOREGIT=true \
+	 MANDIR=/usr/share/man \
+	 DOCDIR=/usr/share/doc/haproxy \
+         USE_PCRE=1
+
+ifeq ($(shell dpkg-architecture -qDEB_HOST_ARCH_OS),linux)
+	MAKEARGS+= TARGET=linux26 \
+	           USE_LINUX_SPLICE=1 \
+	           USE_LINUX_TPROXY=1
+else
+	MAKEARGS+= TARGET=generic
+endif
+ifeq ($(shell dpkg-architecture -qDEB_HOST_ARCH_CPU),i386)
+	MAKEARGS+= USE_REGPARM=1
+endif
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	make $(MAKEARGS)
+
+override_dh_auto_install:
+	make $(MAKEARGS) install
+	cp README debian/haproxy/usr/share/doc/haproxy
+	dh_installchangelogs CHANGELOG
+	mkdir -p debian/haproxy/etc/haproxy
+	cp -r examples/errorfiles debian/haproxy/etc/haproxy/errors
+	rm debian/haproxy/etc/haproxy/errors/README
+	cp debian/haproxy.cfg debian/haproxy/etc/haproxy
+

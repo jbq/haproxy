@@ -1,0 +1,4 @@
+# upstream examples included in the doc/package directory could be useful
+haproxy: example-shell-script-fails-syntax-check ./usr/share/doc/haproxy/examples/build.cfg
+haproxy: example-shell-script-fails-syntax-check ./usr/share/doc/haproxy/examples/haproxy-1.1.21-flx.1.pkg
+haproxy: example-shell-script-fails-syntax-check ./usr/share/doc/haproxy/examples/init.haproxy

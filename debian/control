@@ -1,0 +1,17 @@
+Source: haproxy
+Section: net
+Priority: optional
+Maintainer: Arnaud Cornet <acornet@debian.org>
+Standards-Version: 3.8.4
+Build-Depends: debhelper (>= 7.0.50~), libpcre3-dev, quilt (>= 0.46-7~)
+Homepage: http://haproxy.1wt.eu/
+
+Package: haproxy
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}, adduser
+Description: fast and reliable load balancing reverse proxy
+ HAProxy is a TCP/HTTP reverse proxy which is particularly suited for high
+ availability environments. It features connection persistence through HTTP
+ cookies, load balancing, header addition, modification, deletion both ways. It
+ has request blocking capabilities and provides interface to display server
+ status.
