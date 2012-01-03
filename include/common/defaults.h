@@ -41,7 +41,7 @@
 #endif
 
 #define REQURI_LEN      1024
-#define CAPTURE_LEN     64
+#define CAPTURE_LEN     1536
 
 // maximum line size when parsing config
 #ifndef LINESIZE
