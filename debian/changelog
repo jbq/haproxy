@@ -1,3 +1,9 @@
+haproxy (1.4.8-1ubuntu2) stable; urgency=low
+
+  * Increase syslog line size
+
+ -- Jean-Baptiste Quenot <jbq@md1.nomao.com>  Thu, 05 Jan 2012 14:40:13 +0100
+
 haproxy (1.4.8-1ubuntu1) stable; urgency=low
 
   * Increase CAPTURE_LEN for logging on new architecture
