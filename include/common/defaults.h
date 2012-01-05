@@ -40,7 +40,7 @@
 #define MAXREWRITE      (BUFSIZE / 2)
 #endif
 
-#define REQURI_LEN      1024
+#define REQURI_LEN      4096
 #define CAPTURE_LEN     1536
 
 // maximum line size when parsing config
