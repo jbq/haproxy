@@ -1,3 +1,9 @@
+haproxy (1.4.8-1ubuntu3) stable; urgency=low
+
+  * Increase length of URI
+
+ -- Jean-Baptiste Quenot <jbq@md1.nomao.com>  Thu, 05 Jan 2012 15:40:16 +0100
+
 haproxy (1.4.8-1ubuntu2) stable; urgency=low
 
   * Increase syslog line size
