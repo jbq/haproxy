@@ -1,7 +1,7 @@
 /*
  * Client-side variables and functions.
  *
- * Copyright 2000-2009 Willy Tarreau <w@1wt.eu>
+ * Copyright 2000-2010 Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -33,6 +33,7 @@
 #include <proto/log.h>
 #include <proto/hdr_idx.h>
 #include <proto/pattern.h>
+#include <proto/protocols.h>
 #include <proto/proto_tcp.h>
 #include <proto/proto_http.h>
 #include <proto/proxy.h>
@@ -121,7 +122,7 @@ int event_accept(int fd) {
 
 		if ((s = pool_alloc2(pool2_session)) == NULL) { /* disable this proxy for a while */
 			Alert("out of memory in event_accept().\n");
-			EV_FD_CLR(fd, DIR_RD);
+			disable_listener(l);
 			p->state = PR_STIDLE;
 			goto out_close;
 		}
@@ -149,7 +150,7 @@ int event_accept(int fd) {
 
 		if ((t = task_new()) == NULL) { /* disable this proxy for a while */
 			Alert("out of memory in event_accept().\n");
-			EV_FD_CLR(fd, DIR_RD);
+			disable_listener(l);
 			p->state = PR_STIDLE;
 			goto out_free_session;
 		}
@@ -416,6 +417,11 @@ int event_accept(int fd) {
 		s->si[0].ob = s->si[1].ib = s->rep;
 		s->rep->analysers = 0;
 
+		if (s->fe->options2 & PR_O2_NODELAY) {
+			s->req->flags |= BF_NEVER_WAIT;
+			s->rep->flags |= BF_NEVER_WAIT;
+		}
+
 		s->rep->rto = s->be->timeout.server;
 		s->rep->wto = s->fe->timeout.client;
 		s->rep->cto = TICK_ETERNITY;
@@ -580,6 +586,9 @@ static int
 pattern_fetch_dst(struct proxy *px, struct session *l4, void *l7, int dir,
                   const char *arg, int arg_len, union pattern_data *data)
 {
+	if (!(l4->flags & SN_FRT_ADDR_SET))
+		get_frt_addr(l4);
+
 	data->ip.s_addr = ((struct sockaddr_in *)&l4->frt_addr)->sin_addr.s_addr;
 	return 1;
 }
@@ -605,6 +614,9 @@ pattern_fetch_dport(struct proxy *px, struct session *l4, void *l7, int dir,
                     const char *arg, int arg_len, union pattern_data *data)
 
 {
+	if (!(l4->flags & SN_FRT_ADDR_SET))
+		get_frt_addr(l4);
+
 	data->integer = ntohs(((struct sockaddr_in *)&l4->frt_addr)->sin_port);
 	return 1;
 }

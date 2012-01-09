@@ -95,7 +95,6 @@
 
 /* list of config files */
 static struct list cfg_cfgfiles = LIST_HEAD_INIT(cfg_cfgfiles);
-char *progname = NULL;		/* program name */
 int  pid;			/* current process id */
 int  relative_pid = 1;		/* process id starting at 1 */
 
@@ -118,6 +117,7 @@ struct global global = {
 	.tune = {
 		.bufsize = BUFSIZE,
 		.maxrewrite = MAXREWRITE,
+		.chksize = BUFSIZE,
 	},
 	/* others NULL OK */
 };
@@ -131,7 +131,6 @@ int stopping;	/* non zero means stopping in progress */
  * our ports. With 200 retries, that's about 2 seconds.
  */
 #define MAX_START_RETRIES	200
-static int nb_oldpids = 0;
 static int *oldpids = NULL;
 static int oldpids_sig; /* use USR1 or TERM */
 
@@ -143,6 +142,7 @@ char trash[BUFSIZE];
  */
 char *swap_buffer = NULL;
 
+int nb_oldpids = 0;
 const int zero = 0;
 const int one = 1;
 const struct linger nolinger = { .l_onoff = 1, .l_linger = 0 };
@@ -157,7 +157,7 @@ char hostname[MAX_HOSTNAME_LEN];
 void display_version()
 {
 	printf("HA-Proxy version " HAPROXY_VERSION " " HAPROXY_DATE"\n");
-	printf("Copyright 2000-2010 Willy Tarreau <w@1wt.eu>\n\n");
+	printf("Copyright 2000-2011 Willy Tarreau <w@1wt.eu>\n\n");
 }
 
 void display_build_opts()
@@ -392,11 +392,11 @@ void init(int argc, char **argv)
 {
 	int i;
 	int arg_mode = 0;	/* MODE_DEBUG, ... */
-	char *old_argv = *argv;
 	char *tmp;
 	char *cfg_pidfile = NULL;
 	int err_code = 0;
 	struct wordlist *wl;
+	char *progname;
 
 	/*
 	 * Initialize the previously static variables.
@@ -440,6 +440,9 @@ void init(int argc, char **argv)
 	progname = *argv;
 	while ((tmp = strchr(progname, '/')) != NULL)
 		progname = tmp + 1;
+
+	/* the process name is used for the logs only */
+	global.log_tag = strdup(progname);
 
 	argc--; argv++;
 	while (argc > 0) {
@@ -501,7 +504,7 @@ void init(int argc, char **argv)
 					while (argc > 0) {
 						oldpids[nb_oldpids] = atol(*argv);
 						if (oldpids[nb_oldpids] <= 0)
-							usage(old_argv);
+							usage(progname);
 						argc--; argv++;
 						nb_oldpids++;
 					}
@@ -510,7 +513,7 @@ void init(int argc, char **argv)
 			else { /* >=2 args */
 				argv++; argc--;
 				if (argc == 0)
-					usage(old_argv);
+					usage(progname);
 
 				switch (*flag) {
 				case 'n' : cfg_maxconn = atol(*argv); break;
@@ -526,12 +529,12 @@ void init(int argc, char **argv)
 					LIST_ADDQ(&cfg_cfgfiles, &wl->list);
 					break;
 				case 'p' : cfg_pidfile = *argv; break;
-				default: usage(old_argv);
+				default: usage(progname);
 				}
 			}
 		}
 		else
-			usage(old_argv);
+			usage(progname);
 		argv++; argc--;
 	}
 
@@ -540,7 +543,7 @@ void init(int argc, char **argv)
 			     | MODE_QUIET | MODE_CHECK | MODE_DEBUG));
 
 	if (LIST_ISEMPTY(&cfg_cfgfiles))
-		usage(old_argv);
+		usage(progname);
 
 	/* NB: POSIX does not make it mandatory for gethostname() to NULL-terminate
 	 * the string in case of truncation, and at least FreeBSD appears not to do
@@ -857,6 +860,11 @@ void deinit(void)
 				task_free(s->check);
 			}
 
+			if (s->warmup) {
+				task_delete(s->warmup);
+				task_free(s->warmup);
+			}
+
 			free(s->id);
 			free(s->cookie);
 			free(s->check_data);
@@ -867,6 +875,8 @@ void deinit(void)
 		l = p->listen;
 		while (l) {
 			l_next = l->next;
+			unbind_listener(l);
+			delete_listener(l);
 			free(l->name);
 			free(l->counters);
 			free(l);
@@ -906,6 +916,8 @@ void deinit(void)
 
 	protocol_unbind_all();
 
+	free(global.log_send_hostname); global.log_send_hostname = NULL;
+	free(global.log_tag); global.log_tag = NULL;
 	free(global.chroot);  global.chroot = NULL;
 	free(global.pidfile); global.pidfile = NULL;
 	free(global.node);    global.node = NULL;
@@ -935,12 +947,17 @@ void deinit(void)
 
 } /* end deinit() */
 
-/* sends the signal <sig> to all pids found in <oldpids> */
-static void tell_old_pids(int sig)
+/* sends the signal <sig> to all pids found in <oldpids>. Returns the number of
+ * pids the signal was correctly delivered to.
+ */
+static int tell_old_pids(int sig)
 {
 	int p;
+	int ret = 0;
 	for (p = 0; p < nb_oldpids; p++)
-		kill(oldpids[p], sig);
+		if (kill(oldpids[p], sig) == 0)
+			ret++;
+	return ret;
 }
 
 /*
@@ -1001,6 +1018,33 @@ int main(int argc, char **argv)
 	 */
 	signal(SIGPIPE, SIG_IGN);
 
+	/* ulimits */
+	if (!global.rlimit_nofile)
+		global.rlimit_nofile = global.maxsock;
+
+	if (global.rlimit_nofile) {
+		limit.rlim_cur = limit.rlim_max = global.rlimit_nofile;
+		if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
+			Warning("[%s.main()] Cannot raise FD limit to %d.\n", argv[0], global.rlimit_nofile);
+		}
+	}
+
+	if (global.rlimit_memmax) {
+		limit.rlim_cur = limit.rlim_max =
+			global.rlimit_memmax * 1048576 / global.nbproc;
+#ifdef RLIMIT_AS
+		if (setrlimit(RLIMIT_AS, &limit) == -1) {
+			Warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
+				argv[0], global.rlimit_memmax);
+		}
+#else
+		if (setrlimit(RLIMIT_DATA, &limit) == -1) {
+			Warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
+				argv[0], global.rlimit_memmax);
+		}
+#endif
+	}
+
 	/* We will loop at most 100 times with 10 ms delay each time.
 	 * That's at most 1 second. We only send a signal to old pids
 	 * if we cannot grab at least one port.
@@ -1013,14 +1057,18 @@ int main(int argc, char **argv)
 		/* exit the loop on no error or fatal error */
 		if ((err & (ERR_RETRYABLE|ERR_FATAL)) != ERR_RETRYABLE)
 			break;
-		if (nb_oldpids == 0)
+		if (nb_oldpids == 0 || retry == 0)
 			break;
 
 		/* FIXME-20060514: Solaris and OpenBSD do not support shutdown() on
 		 * listening sockets. So on those platforms, it would be wiser to
 		 * simply send SIGUSR1, which will not be undoable.
 		 */
-		tell_old_pids(SIGTTOU);
+		if (tell_old_pids(SIGTTOU) == 0) {
+			/* no need to wait if we can't contact old pids */
+			retry = 0;
+			continue;
+		}
 		/* give some time to old processes to stop listening */
 		w.tv_sec = 0;
 		w.tv_usec = 10*1000;
@@ -1079,33 +1127,6 @@ int main(int argc, char **argv)
 		pidfile = fdopen(pidfd, "w");
 	}
 
-	/* ulimits */
-	if (!global.rlimit_nofile)
-		global.rlimit_nofile = global.maxsock;
-
-	if (global.rlimit_nofile) {
-		limit.rlim_cur = limit.rlim_max = global.rlimit_nofile;
-		if (setrlimit(RLIMIT_NOFILE, &limit) == -1) {
-			Warning("[%s.main()] Cannot raise FD limit to %d.\n", argv[0], global.rlimit_nofile);
-		}
-	}
-
-	if (global.rlimit_memmax) {
-		limit.rlim_cur = limit.rlim_max =
-			global.rlimit_memmax * 1048576 / global.nbproc;
-#ifdef RLIMIT_AS
-		if (setrlimit(RLIMIT_AS, &limit) == -1) {
-			Warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
-				argv[0], global.rlimit_memmax);
-		}
-#else
-		if (setrlimit(RLIMIT_DATA, &limit) == -1) {
-			Warning("[%s.main()] Cannot fix MEM limit to %d megs.\n",
-				argv[0], global.rlimit_memmax);
-		}
-#endif
-	}
-
 #ifdef CONFIG_HAP_CTTPROXY
 	if (global.last_checks & LSTCHK_CTTPROXY) {
 		int ret;
@@ -1150,7 +1171,7 @@ int main(int argc, char **argv)
 	}
 
 	if (nb_oldpids)
-		tell_old_pids(oldpids_sig);
+		nb_oldpids = tell_old_pids(oldpids_sig);
 
 	/* Note that any error at this stage will be fatal because we will not
 	 * be able to restart the old pids.
@@ -1201,8 +1222,11 @@ int main(int argc, char **argv)
 		/* close the pidfile both in children and father */
 		if (pidfile != NULL)
 			fclose(pidfile);
-		free(global.pidfile);
-		global.pidfile = NULL;
+
+		/* We won't ever use this anymore */
+		free(oldpids);        oldpids = NULL;
+		free(global.chroot);  global.chroot = NULL;
+		free(global.pidfile); global.pidfile = NULL;
 
 		/* we might have to unbind some proxies from some processes */
 		px = proxy;

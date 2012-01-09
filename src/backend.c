@@ -244,7 +244,7 @@ struct server *get_server_ph_post(struct session *s)
 	struct http_msg *msg  = &txn->req;
 	struct proxy    *px   = s->be;
 	unsigned int     plen = px->url_param_len;
-	unsigned long    len  = msg->hdr_content_len;
+	unsigned long    len  = msg->body_len;
 	const char      *params = req->data + msg->sov;
 	const char      *p    = params;
 
@@ -545,14 +545,13 @@ int assign_server(struct session *s)
 				/* URL Parameter hashing */
 				if (s->txn.req.msg_state < HTTP_MSG_BODY)
 					break;
-				if (s->txn.meth == HTTP_METH_POST &&
-				    memchr(s->txn.req.sol + s->txn.req.sl.rq.u, '&',
-					   s->txn.req.sl.rq.u_l ) == NULL)
+
+				s->srv = get_server_ph(s->be,
+						       s->txn.req.sol + s->txn.req.sl.rq.u,
+						       s->txn.req.sl.rq.u_l);
+
+				if (!s->srv && s->txn.meth == HTTP_METH_POST)
 					s->srv = get_server_ph_post(s);
-				else
-					s->srv = get_server_ph(s->be,
-							       s->txn.req.sol + s->txn.req.sl.rq.u,
-							       s->txn.req.sl.rq.u_l);
 				break;
 
 			case BE_LB_HASH_HDR:
@@ -659,6 +658,17 @@ int assign_server_address(struct session *s)
 			return SRV_STATUS_INTERNAL;
 
 		s->srv_addr = s->srv->addr;
+
+		if (!s->srv_addr.sin_addr.s_addr) {
+			/* if the server has no address, we use the same address
+			 * the client asked, which is handy for remapping ports
+			 * locally on multiple addresses at once.
+			 */
+			if (!(s->be->options & PR_O_TRANSP) && !(s->flags & SN_FRT_ADDR_SET))
+				get_frt_addr(s);
+
+			s->srv_addr.sin_addr = ((struct sockaddr_in *)&s->frt_addr)->sin_addr;
+		}
 
 		/* if this server remaps proxied ports, we'll use
 		 * the port the client connected to with an offset. */
@@ -1286,6 +1296,33 @@ acl_fetch_connslots(struct proxy *px, struct session *l4, void *l7, int dir,
 	return 1;
 }
 
+/* set test->i to the id of the backend */
+static int
+acl_fetch_be_id(struct proxy *px, struct session *l4, void *l7, int dir,
+                struct acl_expr *expr, struct acl_test *test) {
+
+	test->flags = ACL_TEST_F_READ_ONLY;
+
+	test->i = l4->be->uuid;
+
+	return 1;
+}
+
+/* set test->i to the id of the server */
+static int
+acl_fetch_srv_id(struct proxy *px, struct session *l4, void *l7, int dir,
+                struct acl_expr *expr, struct acl_test *test) {
+
+	if (!l4->srv)
+		return 0;
+
+	test->flags = ACL_TEST_F_READ_ONLY;
+
+	test->i = l4->srv->puid;
+
+	return 1;
+}
+
 /* set test->i to the number of connections per second reaching the frontend */
 static int
 acl_fetch_fe_sess_rate(struct proxy *px, struct session *l4, void *l7, int dir,
@@ -1429,6 +1466,8 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "queue", acl_parse_int, acl_fetch_queue_size, acl_match_int, ACL_USE_NOTHING },
 	{ "avg_queue", acl_parse_int, acl_fetch_avg_queue_size, acl_match_int, ACL_USE_NOTHING },
 	{ "srv_is_up",    acl_parse_nothing,   acl_fetch_srv_is_up,  acl_match_nothing, ACL_USE_NOTHING },
+	{ "be_id",        acl_parse_int,     acl_fetch_be_id,          acl_match_int,     ACL_USE_NOTHING },
+	{ "srv_id",       acl_parse_int,     acl_fetch_srv_id,         acl_match_int,     ACL_USE_NOTHING },
 	{ NULL, NULL, NULL, NULL },
 }};
 

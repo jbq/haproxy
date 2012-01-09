@@ -264,6 +264,7 @@ int sess_update_st_cer(struct session *s, struct stream_interface *si)
 		if (s->srv)
 			s->srv->counters.failed_conns++;
 		s->be->counters.failed_conns++;
+		sess_change_server(s, NULL);
 		if (may_dequeue_tasks(s->srv, s->be))
 			process_srv_queue(s->srv);
 
@@ -286,6 +287,7 @@ int sess_update_st_cer(struct session *s, struct stream_interface *si)
 	 */
 	if (s->srv && s->conn_retries == 0 &&
 	    s->be->options & PR_O_REDISP && !(s->flags & SN_FORCE_PRST)) {
+		sess_change_server(s, NULL);
 		if (may_dequeue_tasks(s->srv, s->be))
 			process_srv_queue(s->srv);
 
@@ -393,6 +395,7 @@ void sess_update_stream_int(struct session *s, struct stream_interface *si)
 			s->be->counters.failed_conns++;
 
 			/* release other sessions waiting for this server */
+			sess_change_server(s, NULL);
 			if (may_dequeue_tasks(s->srv, s->be))
 				process_srv_queue(s->srv);
 
@@ -1405,6 +1408,19 @@ resync_stream_interface:
 			    s->srv->rdr_len && (s->flags & SN_REDIRECTABLE))
 				perform_http_redirect(s, &s->si[1]);
 		} while (s->si[1].state == SI_ST_ASS);
+
+		/* Now we can add the server name to a header (if requested) */
+		/* check for HTTP mode and proxy server_name_hdr_name != NULL */
+		if ((s->flags && SN_BE_ASSIGNED) &&
+			(s->be->mode == PR_MODE_HTTP) &&
+			(s->be->server_id_hdr_name != NULL)) {
+
+			http_send_name_header(&s->txn,
+					      &s->txn.req,
+					      s->req,
+					      s->be,
+					      s->srv->id);
+		}
 	}
 
 	/* Benchmarks have shown that it's optimal to do a full resync now */

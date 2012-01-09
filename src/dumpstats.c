@@ -73,6 +73,36 @@ const char stats_permission_denied_msg[] =
 	"Permission denied\n"
 	"";
 
+/* allocate a new stats frontend named <name>, and return it
+ * (or NULL in case of lack of memory).
+ */
+static struct proxy *alloc_stats_fe(const char *name)
+{
+	struct proxy *fe;
+
+	fe = (struct proxy *)calloc(1, sizeof(struct proxy));
+	if (!fe)
+		return NULL;
+
+	LIST_INIT(&fe->pendconns);
+	LIST_INIT(&fe->acl);
+	LIST_INIT(&fe->block_cond);
+	LIST_INIT(&fe->redirect_rules);
+	LIST_INIT(&fe->mon_fail_cond);
+	LIST_INIT(&fe->switching_rules);
+	LIST_INIT(&fe->tcp_req.inspect_rules);
+
+	/* Timeouts are defined as -1, so we cannot use the zeroed area
+	 * as a default value.
+	 */
+	proxy_reset_timeouts(fe);
+
+	fe->last_change = now.tv_sec;
+	fe->id = strdup("GLOBAL");
+	fe->cap = PR_CAP_FE;
+	return fe;
+}
+
 /* This function parses a "stats" statement in the "global" section. It returns
  * -1 if there is any error, otherwise zero. If it returns -1, it may write an
  * error message into ther <err> buffer, for at most <errlen> bytes, trailing
@@ -84,7 +114,7 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 {
 	args++;
 	if (!strcmp(args[0], "socket")) {
-		struct sockaddr_un su;
+		struct sockaddr_un *su;
 		int cur_arg;
 
 		if (*args[1] == 0) {
@@ -97,33 +127,19 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 			return -1;
 		}
 
-		su.sun_family = AF_UNIX;
-		strncpy(su.sun_path, args[1], sizeof(su.sun_path));
-		su.sun_path[sizeof(su.sun_path) - 1] = 0;
-		memcpy(&global.stats_sock.addr, &su, sizeof(su)); // guaranteed to fit
+		su = str2sun(args[1]);
+		if (!su) {
+			snprintf(err, errlen, "'stats socket' path would require truncation");
+			return -1;
+		}
+		memcpy(&global.stats_sock.addr, su, sizeof(struct sockaddr_un)); // guaranteed to fit
 
 		if (!global.stats_fe) {
-			if ((global.stats_fe = (struct proxy *)calloc(1, sizeof(struct proxy))) == NULL) {
+			if ((global.stats_fe = alloc_stats_fe("GLOBAL")) == NULL) {
 				snprintf(err, errlen, "out of memory");
 				return -1;
 			}
-
-			LIST_INIT(&global.stats_fe->pendconns);
-			LIST_INIT(&global.stats_fe->acl);
-			LIST_INIT(&global.stats_fe->block_cond);
-			LIST_INIT(&global.stats_fe->redirect_rules);
-			LIST_INIT(&global.stats_fe->mon_fail_cond);
-			LIST_INIT(&global.stats_fe->switching_rules);
-			LIST_INIT(&global.stats_fe->tcp_req.inspect_rules);
-
-			/* Timeouts are defined as -1, so we cannot use the zeroed area
-			 * as a default value.
-			 */
-			proxy_reset_timeouts(global.stats_fe);
-
-			global.stats_fe->last_change = now.tv_sec;
-			global.stats_fe->id = strdup("GLOBAL");
-			global.stats_fe->cap = PR_CAP_FE;
+			global.stats_fe->timeout.client = MS_TO_TICKS(10000); /* default timeout of 10 seconds */
 		}
 
 		global.stats_sock.state = LI_INIT;
@@ -134,8 +150,6 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 		global.stats_sock.nice = -64;  /* we want to boost priority for local stats */
 		global.stats_sock.private = global.stats_fe; /* must point to the frontend */
 		global.stats_sock.perm.ux.level = ACCESS_LVL_OPER; /* default access level */
-
-		global.stats_fe->timeout.client = MS_TO_TICKS(10000); /* default timeout of 10 seconds */
 		global.stats_sock.timeout = &global.stats_fe->timeout.client;
 
 		global.stats_sock.next  = global.stats_fe->listen;
@@ -211,6 +225,12 @@ static int stats_parse_global(char **args, int section_type, struct proxy *curpx
 		if (!timeout) {
 			snprintf(err, errlen, "a positive value is expected for 'stats timeout' in 'global section'");
 			return -1;
+		}
+		if (!global.stats_fe) {
+			if ((global.stats_fe = alloc_stats_fe("GLOBAL")) == NULL) {
+				snprintf(err, errlen, "out of memory");
+				return -1;
+			}
 		}
 		global.stats_fe->timeout.client = MS_TO_TICKS(timeout);
 	}
@@ -460,6 +480,12 @@ int stats_sock_parse_request(struct stream_interface *si, char *line)
 				return 1;
 			}
 
+			if (px->state == PR_STSTOPPED) {
+				s->data_ctx.cli.msg = "Proxy is disabled.\n";
+				si->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+
 			/* if the weight is terminated with '%', it is set relative to
 			 * the initial weight, otherwise it is absolute.
 			 */
@@ -570,6 +596,12 @@ int stats_sock_parse_request(struct stream_interface *si, char *line)
 				return 1;
 			}
 
+			if (px->state == PR_STSTOPPED) {
+				s->data_ctx.cli.msg = "Proxy is disabled.\n";
+				si->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+
 			if (sv->state & SRV_MAINTAIN) {
 				/* The server is really in maintenance, we can change the server state */
 				if (sv->tracked) {
@@ -578,12 +610,14 @@ int stats_sock_parse_request(struct stream_interface *si, char *line)
 					*/
 					if (sv->tracked->state & SRV_RUNNING) {
 						set_server_up(sv);
+						sv->health = sv->rise;	/* up, but will fall down at first failure */
 					} else {
 						sv->state &= ~SRV_MAINTAIN;
 						set_server_down(sv);
 					}
 				} else {
 					set_server_up(sv);
+					sv->health = sv->rise;	/* up, but will fall down at first failure */
 				}
 			}
 
@@ -619,6 +653,12 @@ int stats_sock_parse_request(struct stream_interface *si, char *line)
 
 			if (!get_backend_server(args[2], line, &px, &sv)) {
 				s->data_ctx.cli.msg = px ? "No such server.\n" : "No such backend.\n";
+				si->st0 = STAT_CLI_PRINT;
+				return 1;
+			}
+
+			if (px->state == PR_STSTOPPED) {
+				s->data_ctx.cli.msg = "Proxy is disabled.\n";
 				si->st0 = STAT_CLI_PRINT;
 				return 1;
 			}
@@ -954,6 +994,44 @@ int stats_dump_raw_to_buffer(struct session *s, struct buffer *rep)
 }
 
 
+/* We don't want to land on the posted stats page because a refresh will
+ * repost the data.  We don't want this to happen on accident so we redirect
+ * the browse to the stats page with a GET.
+ */
+int stats_http_redir(struct session *s, struct buffer *rep, struct uri_auth *uri)
+{
+	struct chunk msg;
+
+	chunk_init(&msg, trash, sizeof(trash));
+
+	switch (s->data_state) {
+	case DATA_ST_INIT:
+		chunk_printf(&msg,
+			"HTTP/1.0 303 See Other\r\n"
+			"Cache-Control: no-cache\r\n"
+			"Content-Type: text/plain\r\n"
+			"Connection: close\r\n"
+			"Location: %s;st=%s",
+			uri->uri_prefix, s->data_ctx.stats.st_code);
+		chunk_printf(&msg, "\r\n\r\n");
+
+		if (buffer_feed_chunk(rep, &msg) >= 0)
+			return 0;
+
+		s->txn.status = 303;
+
+		if (!(s->flags & SN_ERR_MASK))  // this is not really an error but it is
+			s->flags |= SN_ERR_PRXCOND; // to mark that it comes from the proxy
+		if (!(s->flags & SN_FINST_MASK))
+			s->flags |= SN_FINST_R;
+
+		s->data_state = DATA_ST_FIN;
+		return 1;
+	}
+	return 1;
+}
+
+
 /* This I/O handler runs as an applet embedded in a stream interface. It is
  * used to send HTTP stats over a TCP socket. The mechanism is very simple.
  * si->st0 becomes non-zero once the transfer is finished. The handler
@@ -973,9 +1051,16 @@ void http_stats_io_handler(struct stream_interface *si)
 		si->st0 = 1;
 
 	if (!si->st0) {
-		if (stats_dump_http(s, res, s->be->uri_auth)) {
-			si->st0 = 1;
-			si->shutw(si);
+		if (s->txn.meth == HTTP_METH_POST) {
+			if (stats_http_redir(s, res, s->be->uri_auth)) {
+				si->st0 = 1;
+				si->shutw(si);
+			}
+		} else {
+			if (stats_dump_http(s, res, s->be->uri_auth)) {
+				si->st0 = 1;
+				si->shutw(si);
+			}
 		}
 	}
 
@@ -1265,6 +1350,46 @@ int stats_dump_http(struct session *s, struct buffer *rep, struct uri_auth *uri)
 			     ""
 			     );
 
+			if (s->data_ctx.stats.st_code) {
+				if (strcmp(s->data_ctx.stats.st_code, STAT_STATUS_DONE) == 0) {
+					chunk_printf(&msg,
+						     "<p><div class=active3>"
+						     "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+						     "Action processed successfully."
+						     "</div>\n", uri->uri_prefix);
+				}
+				else if (strcmp(s->data_ctx.stats.st_code, STAT_STATUS_NONE) == 0) {
+					chunk_printf(&msg,
+						     "<p><div class=active2>"
+						     "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+						     "Nothing has changed."
+						     "</div>\n", uri->uri_prefix);
+				}
+				else if (strcmp(s->data_ctx.stats.st_code, STAT_STATUS_EXCD) == 0) {
+					chunk_printf(&msg,
+						     "<p><div class=active0>"
+						     "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+						     "<b>Action not processed : the buffer couldn't store all the data.<br>"
+						     "You should retry with less servers at a time.</b>"
+						     "</div>\n", uri->uri_prefix);
+				}
+				else if (strcmp(s->data_ctx.stats.st_code, STAT_STATUS_DENY) == 0) {
+					chunk_printf(&msg,
+						     "<p><div class=active0>"
+						     "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+						     "<b>Action denied.</b>"
+						     "</div>\n", uri->uri_prefix);
+				}
+				else {
+					chunk_printf(&msg,
+						     "<p><div class=active6>"
+						     "<a class=lfsb href=\"%s\" title=\"Remove this message\">[X]</a> "
+						     "Unexpected result."
+						     "</div>\n", uri->uri_prefix);
+				}
+				chunk_printf(&msg,"<p>\n");
+			}
+
 			if (buffer_feed_chunk(rep, &msg) >= 0)
 				return 0;
 		}
@@ -1365,6 +1490,13 @@ int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri)
 
 	case DATA_ST_PX_TH:
 		if (!(s->data_ctx.stats.flags & STAT_FMT_CSV)) {
+			if (px->cap & PR_CAP_BE && px->srv && (s->data_ctx.stats.flags & STAT_ADMIN)) {
+				/* A form to enable/disable this proxy servers */
+				chunk_printf(&msg,
+					"<form action=\"%s\" method=\"post\">",
+					uri->uri_prefix);
+			}
+
 			/* print a new table */
 			chunk_printf(&msg,
 				     "<table class=\"tbl\" width=\"100%%\">\n"
@@ -1387,7 +1519,18 @@ int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri)
 				     "</tr>\n"
 				     "</table>\n"
 				     "<table class=\"tbl\" width=\"100%%\">\n"
-				     "<tr class=\"titre\">"
+				     "<tr class=\"titre\">",
+				     (uri->flags & ST_SHLGNDS)?"<u>":"",
+				     px->id, px->id, px->id,
+				     (uri->flags & ST_SHLGNDS)?"</u>":"",
+				     px->desc ? "desc" : "empty", px->desc ? px->desc : "");
+
+			if (px->cap & PR_CAP_BE && px->srv && (s->data_ctx.stats.flags & STAT_ADMIN)) {
+				 /* Column heading for Enable or Disable server */
+				chunk_printf(&msg, "<th rowspan=2 width=1></th>");
+			}
+
+			chunk_printf(&msg,
 				     "<th rowspan=2></th>"
 				     "<th colspan=3>Queue</th>"
 				     "<th colspan=3>Session rate</th><th colspan=5>Sessions</th>"
@@ -1404,11 +1547,7 @@ int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri)
 				     "<th>Status</th><th>LastChk</th><th>Wght</th><th>Act</th>"
 				     "<th>Bck</th><th>Chk</th><th>Dwn</th><th>Dwntme</th>"
 				     "<th>Thrtle</th>\n"
-				     "</tr>",
-				     (uri->flags & ST_SHLGNDS)?"<u>":"",
-				     px->id, px->id, px->id,
-				     (uri->flags & ST_SHLGNDS)?"</u>":"",
-				     px->desc ? "desc" : "empty", px->desc ? px->desc : "");
+				     "</tr>");
 
 			if (buffer_feed_chunk(rep, &msg) >= 0)
 				return 0;
@@ -1424,9 +1563,18 @@ int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri)
 			if (!(s->data_ctx.stats.flags & STAT_FMT_CSV)) {
 				chunk_printf(&msg,
 				     /* name, queue */
-				     "<tr class=\"frontend\"><td class=ac>"
+				     "<tr class=\"frontend\">");
+
+				if (px->cap & PR_CAP_BE && px->srv && (s->data_ctx.stats.flags & STAT_ADMIN)) {
+					/* Column sub-heading for Enable or Disable server */
+					chunk_printf(&msg, "<td></td>");
+				}
+
+				chunk_printf(&msg,
+				     "<td class=ac>"
 				     "<a name=\"%s/Frontend\"></a>"
-				     "<a class=lfsb href=\"#%s/Frontend\">Frontend</a></td><td colspan=3></td>"
+				     "<a class=lfsb href=\"#%s/Frontend\">Frontend</a></td>"
+				     "<td colspan=3></td>"
 				     "",
 				     px->id, px->id);
 
@@ -1438,7 +1586,7 @@ int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri)
 						     read_freq_ctr(&px->fe_req_per_sec),
 						     U2H0(read_freq_ctr(&px->fe_sess_per_sec)),
 						     px->counters.fe_rps_max,
-						     U2H2(px->counters.fe_sps_max),
+						     U2H1(px->counters.fe_sps_max),
 						     LIM2A2(px->fe_sps_lim, "-"));
 				} else {
 					chunk_printf(&msg,
@@ -1584,7 +1732,12 @@ int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri)
 			}
 
 			if (!(s->data_ctx.stats.flags & STAT_FMT_CSV)) {
-				chunk_printf(&msg, "<tr class=socket><td class=ac");
+				chunk_printf(&msg, "<tr class=socket>");
+				if (px->cap & PR_CAP_BE && px->srv && (s->data_ctx.stats.flags & STAT_ADMIN)) {
+					 /* Column sub-heading for Enable or Disable server */
+					chunk_printf(&msg, "<td></td>");
+				}
+				chunk_printf(&msg, "<td class=ac");
 
 					if (uri->flags&ST_SHLGNDS) {
 						char str[INET6_ADDRSTRLEN], *fmt = NULL;
@@ -1758,15 +1911,23 @@ int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri)
 				if ((sv->state & SRV_MAINTAIN) || (svs->state & SRV_MAINTAIN)) {
 					chunk_printf(&msg,
 					    /* name */
-					    "<tr class=\"maintain\"><td class=ac"
+					    "<tr class=\"maintain\">"
 					);
 				}
 				else {
 					chunk_printf(&msg,
 					    /* name */
-					    "<tr class=\"%s%d\"><td class=ac",
+					    "<tr class=\"%s%d\">",
 					    (sv->state & SRV_BACKUP) ? "backup" : "active", sv_state);
 				}
+
+				if (px->cap & PR_CAP_BE && px->srv && (s->data_ctx.stats.flags & STAT_ADMIN)) {
+					chunk_printf(&msg,
+						"<td><input type=\"checkbox\" name=\"s\" value=\"%s\"></td>",
+						sv->id);
+				}
+
+				chunk_printf(&msg, "<td class=ac");
 
 				if (uri->flags&ST_SHLGNDS) {
 					char str[INET6_ADDRSTRLEN];
@@ -2098,9 +2259,12 @@ int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri)
 		if ((px->cap & PR_CAP_BE) &&
 		    (!(s->data_ctx.stats.flags & STAT_BOUND) || (s->data_ctx.stats.type & (1 << STATS_TYPE_BE)))) {
 			if (!(s->data_ctx.stats.flags & STAT_FMT_CSV)) {
-				chunk_printf(&msg,
-				     /* name */
-				     "<tr class=\"backend\"><td class=ac");
+				chunk_printf(&msg, "<tr class=\"backend\">");
+				if (px->cap & PR_CAP_BE && px->srv && (s->data_ctx.stats.flags & STAT_ADMIN)) {
+					/* Column sub-heading for Enable or Disable server */
+					chunk_printf(&msg, "<td></td>");
+				}
+				chunk_printf(&msg, "<td class=ac");
 
 				if (uri->flags&ST_SHLGNDS) {
 					/* balancing */
@@ -2124,6 +2288,7 @@ int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri)
 				}
 
 				chunk_printf(&msg,
+				     /* name */
 				     ">%s<a name=\"%s/Backend\"></a>"
 				     "<a class=lfsb href=\"#%s/Backend\">Backend</a>%s</td>"
 				     /* queue : current, max */
@@ -2286,7 +2451,24 @@ int stats_dump_proxy(struct session *s, struct proxy *px, struct uri_auth *uri)
 
 	case DATA_ST_PX_END:
 		if (!(s->data_ctx.stats.flags & STAT_FMT_CSV)) {
-			chunk_printf(&msg, "</table><p>\n");
+			chunk_printf(&msg, "</table>");
+
+			if (px->cap & PR_CAP_BE && px->srv && (s->data_ctx.stats.flags & STAT_ADMIN)) {
+				/* close the form used to enable/disable this proxy servers */
+				chunk_printf(&msg,
+					"Choose the action to perform on the checked servers : "
+					"<select name=action>"
+					"<option value=\"\"></option>"
+					"<option value=\"disable\">Disable</option>"
+					"<option value=\"enable\">Enable</option>"
+					"</select>"
+					"<input type=\"hidden\" name=\"b\" value=\"%s\">"
+					"&nbsp;<input type=\"submit\" value=\"Apply\">"
+					"</form>",
+					px->id);
+			}
+
+			chunk_printf(&msg, "<p>\n");
 
 			if (buffer_feed_chunk(rep, &msg) >= 0)
 				return 0;
@@ -2384,11 +2566,15 @@ int stats_dump_full_sess_to_buffer(struct session *s, struct buffer *rep)
 			     sess->listener ? sess->listener->name ? sess->listener->name : "?" : "?",
 			     sess->listener ? sess->listener->luid : 0);
 
-		chunk_printf(&msg,
-			     "  backend=%s (id=%u mode=%s) server=%s (id=%u)\n",
-			     sess->be->id, sess->be->uuid, sess->be->mode ? "http" : "tcp",
-			     sess->srv ? sess->srv->id : "<none>",
-			     sess->srv ? sess->srv->puid : 0);
+		if (sess->be->cap & PR_CAP_BE)
+			chunk_printf(&msg,
+				     "  backend=%s (id=%u mode=%s) server=%s (id=%u)\n",
+				     sess->be->id,
+				     sess->be->uuid, sess->be->mode ? "http" : "tcp",
+				     sess->srv ? sess->srv->id : "<none>",
+				     sess->srv ? sess->srv->puid : 0);
+		else
+			chunk_printf(&msg, "  backend=<NONE> (id=-1 mode=-) server=<NONE> (id=-1)\n");
 
 		chunk_printf(&msg,
 			     "  task=%p (state=0x%02x nice=%d calls=%d exp=%s%s)\n",
@@ -2439,7 +2625,7 @@ int stats_dump_full_sess_to_buffer(struct session *s, struct buffer *rep)
 
 
 		chunk_printf(&msg,
-			     "  req=%p (f=0x%06x an=0x%x l=%d sndmx=%d pipe=%d fwd=%ld)\n"
+			     "  req=%p (f=0x%06x an=0x%x l=%d sndmx=%d pipe=%d fwd=%d)\n"
 			     "      an_exp=%s",
 			     sess->req,
 			     sess->req->flags, sess->req->analysers,
@@ -2469,7 +2655,7 @@ int stats_dump_full_sess_to_buffer(struct session *s, struct buffer *rep)
 			     sess->req->total);
 
 		chunk_printf(&msg,
-			     "  res=%p (f=0x%06x an=0x%x l=%d sndmx=%d pipe=%d fwd=%ld)\n"
+			     "  res=%p (f=0x%06x an=0x%x l=%d sndmx=%d pipe=%d fwd=%d)\n"
 			     "      an_exp=%s",
 			     sess->rep,
 			     sess->rep->flags, sess->rep->analysers,
@@ -2593,7 +2779,7 @@ int stats_dump_sess_to_buffer(struct session *s, struct buffer *rep)
 					     pn,
 					     ntohs(((struct sockaddr_in *)&curr_sess->cli_addr)->sin_port),
 					     curr_sess->fe->id,
-					     curr_sess->be->id,
+					     (curr_sess->be->cap & PR_CAP_BE) ? curr_sess->be->id : "<NONE>",
 					     curr_sess->srv ? curr_sess->srv->id : "<none>"
 					     );
 				break;
@@ -2607,7 +2793,7 @@ int stats_dump_sess_to_buffer(struct session *s, struct buffer *rep)
 					     pn,
 					     ntohs(((struct sockaddr_in6 *)&curr_sess->cli_addr)->sin6_port),
 					     curr_sess->fe->id,
-					     curr_sess->be->id,
+					     (curr_sess->be->cap & PR_CAP_BE) ? curr_sess->be->id : "<NONE>",
 					     curr_sess->srv ? curr_sess->srv->id : "<none>"
 					     );
 
@@ -2807,6 +2993,19 @@ int stats_dump_errors_to_buffer(struct session *s, struct buffer *rep)
 		/* the function had not been called yet, let's prepare the
 		 * buffer for a response.
 		 */
+		struct tm tm;
+
+		get_localtime(date.tv_sec, &tm);
+		chunk_printf(&msg, "Total events captured on [%02d/%s/%04d:%02d:%02d:%02d.%03d] : %u\n",
+			     tm.tm_mday, monthname[tm.tm_mon], tm.tm_year+1900,
+			     tm.tm_hour, tm.tm_min, tm.tm_sec, (int)(date.tv_usec/1000),
+			     error_snapshot_id);
+
+		if (buffer_feed_chunk(rep, &msg) >= 0) {
+			/* Socket buffer full. Let's try again later from the same point */
+			return 0;
+		}
+
 		s->data_ctx.errors.px = proxy;
 		s->data_ctx.errors.buf = 0;
 		s->data_ctx.errors.bol = 0;
@@ -2858,23 +3057,27 @@ int stats_dump_errors_to_buffer(struct session *s, struct buffer *rep)
 				chunk_printf(&msg,
 					     " frontend %s (#%d): invalid request\n"
 					     "  src %s, session #%d, backend %s (#%d), server %s (#%d)\n"
+					     "  HTTP internal state %d, buffer flags 0x%08x, event #%u\n"
 					     "  request length %d bytes, error at position %d:\n \n",
 					     s->data_ctx.errors.px->id, s->data_ctx.errors.px->uuid,
 					     pn, es->sid, (es->oe->cap & PR_CAP_BE) ? es->oe->id : "<NONE>",
 					     (es->oe->cap & PR_CAP_BE) ? es->oe->uuid : -1,
 					     es->srv ? es->srv->id : "<NONE>",
 					     es->srv ? es->srv->puid : -1,
+					     es->state, es->flags, es->ev_id,
 					     es->len, es->pos);
 				break;
 			case 1:
 				chunk_printf(&msg,
 					     " backend %s (#%d) : invalid response\n"
 					     "  src %s, session #%d, frontend %s (#%d), server %s (#%d)\n"
+					     "  HTTP internal state %d, buffer flags 0x%08x, event #%u\n"
 					     "  response length %d bytes, error at position %d:\n \n",
 					     s->data_ctx.errors.px->id, s->data_ctx.errors.px->uuid,
 					     pn, es->sid, es->oe->id, es->oe->uuid,
 					     es->srv ? es->srv->id : "<NONE>",
 					     es->srv ? es->srv->puid : -1,
+					     es->state, es->flags, es->ev_id,
 					     es->len, es->pos);
 				break;
 			}

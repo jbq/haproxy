@@ -41,6 +41,7 @@
 int listeners;	/* # of proxy listeners, set by cfgparse, unset by maintain_proxies */
 struct proxy *proxy  = NULL;	/* list of all existing proxies */
 struct eb_root used_proxy_id = EB_ROOT;	/* list of proxy IDs in use */
+unsigned int error_snapshot_id = 0;     /* global ID assigned to each error then incremented */
 
 /*
  * This function returns a string containing a name describing capabilities to
@@ -743,6 +744,11 @@ int session_set_backend(struct session *s, struct proxy *be)
 
 		s->txn.hdr_idx.size = MAX_HTTP_HDR;
 		hdr_idx_init(&s->txn.hdr_idx);
+	}
+
+	if (be->options2 & PR_O2_NODELAY) {
+		s->req->flags |= BF_NEVER_WAIT;
+		s->rep->flags |= BF_NEVER_WAIT;
 	}
 
 	/* We want to enable the backend-specific analysers except those which

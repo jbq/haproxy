@@ -78,7 +78,7 @@
 #define PR_O_COOK_ANY   (PR_O_COOK_RW | PR_O_COOK_IND | PR_O_COOK_INS | PR_O_COOK_PFX)
 #define PR_O_SMTP_CHK   0x00000040      /* use SMTP EHLO check for server health - pvandijk@vision6.com.au */
 #define PR_O_KEEPALIVE  0x00000080      /* follow keep-alive sessions */
-#define PR_O_FWDFOR     0x00000100      /* insert x-forwarded-for with client address */
+#define PR_O_FWDFOR     0x00000100      /* conditionally insert x-forwarded-for with client address */
 #define PR_O_BIND_SRC   0x00000200      /* bind to a specific source address when connect()ing */
 #define PR_O_NULLNOLOG  0x00000400      /* a connect without request will not be logged */
 #define PR_O_COOK_NOC   0x00000800      /* add a 'Cache-control' header with the cookie */
@@ -139,6 +139,19 @@
 #define PR_O2_CHK_SNDST 0x00080000      /* send the state of each server along with HTTP health checks */
 #define PR_O2_SSL3_CHK  0x00100000      /* use SSLv3 CLIENT_HELLO packets for server health */
 #define PR_O2_FAKE_KA   0x00200000      /* pretend we do keep-alive with server eventhough we close */
+#define PR_O2_LDAP_CHK  0x00400000      /* use LDAP check for server health */
+
+#define PR_O2_EXP_NONE  0x00000000      /* http-check : no expect rule */
+#define PR_O2_EXP_STS   0x00800000      /* http-check expect status */
+#define PR_O2_EXP_RSTS  0x01000000      /* http-check expect rstatus */
+#define PR_O2_EXP_STR   0x01800000      /* http-check expect string */
+#define PR_O2_EXP_RSTR  0x02000000      /* http-check expect rstring */
+#define PR_O2_EXP_TYPE  0x03800000      /* mask for http-check expect type */
+#define PR_O2_EXP_INV   0x04000000      /* http-check expect !<rule> */
+#define PR_O2_COOK_PSV  0x08000000      /* cookie ... preserve */
+/* unused: 0x10000000 */
+#define PR_O2_FF_ALWAYS 0x20000000      /* always set x-forwarded-for */
+#define PR_O2_NODELAY   0x40000000      /* fully interactive mode, never delay outgoing data */
 /* end of proxy->options2 */
 
 /* bits for sticking rules */
@@ -151,6 +164,9 @@ struct error_snapshot {
 	unsigned int len;		/* original length of the last invalid request/response */
 	unsigned int pos;		/* position of the first invalid character */
 	unsigned int sid;		/* ID of the faulty session */
+	unsigned int ev_id;		/* event number (counter incremented for each capture) */
+	unsigned int state;		/* message state before the error (when saved) */
+	unsigned int flags;		/* buffer flags */
 	struct server *srv;		/* server associated with the error (or NULL) */
 	struct proxy *oe;		/* other end = frontend or backend involved */
 	struct sockaddr_storage src;	/* client's address */
@@ -190,6 +206,8 @@ struct proxy {
 	char *cookie_domain;			/* domain used to insert the cookie */
 	char *cookie_name;			/* name of the cookie to look for */
 	int  cookie_len;			/* strlen(cookie_name), computed only once */
+	unsigned int cookie_maxidle;		/* max idle time for this cookie */
+	unsigned int cookie_maxlife;		/* max life time for this cookie */
 	char *rdp_cookie_name;			/* name of the RDP cookie to look for */
 	int  rdp_cookie_len;			/* strlen(rdp_cookie_name), computed only once */
 	char *url_param_name;			/* name of the URL parameter used for hashing */
@@ -240,6 +258,8 @@ struct proxy {
 	int fwdfor_hdr_len;			/* length of "x-forwarded-for" header */
 	char *orgto_hdr_name;			/* header to use - default: "x-original-to" */
 	int orgto_hdr_len;			/* length of "x-original-to" header */
+	char *server_id_hdr_name;                   /* the header to use to send the server id (name) */
+	int server_id_hdr_len;                      /* the length of the id (name) header... name */
 
 	unsigned down_trans;			/* up-down transitions */
 	unsigned down_time;			/* total time the proxy was down */
@@ -279,6 +299,8 @@ struct proxy {
 	int grace;				/* grace time after stop request */
 	char *check_req;			/* HTTP or SSL request to use for PR_O_HTTP_CHK|PR_O_SSL3_CHK */
 	int check_len;				/* Length of the HTTP or SSL3 request */
+	char *expect_str;			/* http-check expected content : string or text version of the regex */
+	regex_t *expect_regex;			/* http-check expected content */
 	struct chunk errmsg[HTTP_ERR_SIZE];	/* default or customized error messages for known errors */
 	int uuid;				/* universally unique proxy ID, used for SNMP */
 	unsigned int backlog;			/* force the frontend's listen backlog */
@@ -339,6 +361,7 @@ struct redirect_rule {
 
 extern struct proxy *proxy;
 extern struct eb_root used_proxy_id;	/* list of proxy IDs in use */
+extern unsigned int error_snapshot_id;  /* global ID assigned to each error then incremented */
 
 #endif /* _TYPES_PROXY_H */
 
