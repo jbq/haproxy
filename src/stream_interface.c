@@ -74,6 +74,8 @@ void stream_int_retnclose(struct stream_interface *si, const struct chunk *msg)
 	buffer_abort(si->ib);
 	buffer_auto_close(si->ib);
 	buffer_erase(si->ib);
+
+	buffer_cut_tail(si->ob);
 	if (likely(msg && msg->len))
 		buffer_write(si->ob, msg->str, msg->len);
 
@@ -206,6 +208,8 @@ void stream_int_shutw(struct stream_interface *si)
 		/* fall through */
 	case SI_ST_CON:
 	case SI_ST_CER:
+	case SI_ST_QUE:
+	case SI_ST_TAR:
 		si->state = SI_ST_DIS;
 		/* fall through */
 	default:

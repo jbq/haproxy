@@ -114,6 +114,7 @@
 #define BF_DONT_READ     0x1000000  /* disable reading for now */
 #define BF_EXPECT_MORE   0x2000000  /* more data expected to be sent very soon (one-shoot) */
 #define BF_SEND_DONTWAIT 0x4000000  /* don't wait for sending data (one-shoot) */
+#define BF_NEVER_WAIT    0x8000000  /* never wait for sending data (permanent) */
 
 /* Use these masks to clear the flags before going back to lower layers */
 #define BF_CLEAR_READ     (~(BF_READ_NULL|BF_READ_PARTIAL|BF_READ_ERROR|BF_READ_ATTACHED))
@@ -157,7 +158,7 @@
 
 
 /* Magic value to forward infinite size (TCP, ...), used with ->to_forward */
-#define BUF_INFINITE_FORWARD    (~0UL)
+#define BUF_INFINITE_FORWARD    MAX_RANGE(int)
 
 /* describes a chunk of string */
 struct chunk {
@@ -180,7 +181,7 @@ struct buffer {
 	char *r, *w, *lr;               /* read ptr, write ptr, last read */
 	unsigned int size;              /* buffer size in bytes */
 	unsigned int send_max;          /* number of bytes the sender can consume om this buffer, <= l */
-	unsigned long to_forward;       /* number of bytes to forward after send_max without a wake-up */
+	unsigned int to_forward;        /* number of bytes to forward after send_max without a wake-up */
 	unsigned int analysers;         /* bit field indicating what to do on the buffer */
 	int analyse_exp;                /* expiration date for current analysers (if set) */
 	void (*hijacker)(struct session *, struct buffer *); /* alternative content producer */

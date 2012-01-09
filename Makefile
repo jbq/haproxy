@@ -77,14 +77,14 @@ TARGET =
 #### TARGET CPU
 # Use CPU=<cpu_name> to optimize for a particular CPU, among the following
 # list :
-#    generic, i586, i686, ultrasparc, custom
+#    generic, native, i586, i686, ultrasparc, custom
 CPU = generic
 
 #### Architecture, used when not building for native architecture
 # Use ARCH=<arch_name> to force build for a specific architecture. Known
 # architectures will lead to "-m32" or "-m64" being added to CFLAGS and
 # LDFLAGS. This can be required to build 32-bit binaries on 64-bit targets.
-# Currently, only x86_64, i386, i486, i586 and i686 are understood.
+# Currently, only 32, 64, x86_64, i386, i486, i586 and i686 are understood.
 ARCH =
 
 #### Toolchain options.
@@ -95,6 +95,11 @@ LD = $(CC)
 #### Debug flags (typically "-g").
 # Those flags only feed CFLAGS so it is not mandatory to use this form.
 DEBUG_CFLAGS = -g
+
+#### Compiler-specific flags that may be used to disable some negative over-
+# optimization or to silence some warnings. -fno-strict-aliasing is needed with
+# gcc >= 4.4.
+SPEC_CFLAGS = -fno-strict-aliasing
 
 #### Memory usage tuning
 # If small memory footprint is required, you can reduce the buffer size. There
@@ -133,12 +138,15 @@ SILENT_DEFINE =
 # them. You should not have to change these options. Better use CPU_CFLAGS or
 # even CFLAGS instead.
 CPU_CFLAGS.generic    = -O2
+CPU_CFLAGS.native     = -O2 -march=native
 CPU_CFLAGS.i586       = -O2 -march=i586
 CPU_CFLAGS.i686       = -O2 -march=i686
 CPU_CFLAGS.ultrasparc = -O6 -mcpu=v9 -mtune=ultrasparc
 CPU_CFLAGS            = $(CPU_CFLAGS.$(CPU))
 
 #### ARCH dependant flags, may be overriden by CPU flags
+ARCH_FLAGS.32     = -m32
+ARCH_FLAGS.64     = -m64
 ARCH_FLAGS.i386   = -m32 -march=i386
 ARCH_FLAGS.i486   = -m32 -march=i486
 ARCH_FLAGS.i586   = -m32 -march=i586
@@ -150,7 +158,7 @@ ARCH_FLAGS        = $(ARCH_FLAGS.$(ARCH))
 # These CFLAGS contain general optimization options, CPU-specific optimizations
 # and debug flags. They may be overridden by some distributions which prefer to
 # set all of them at once instead of playing with the CPU and DEBUG variables.
-CFLAGS = $(ARCH_FLAGS) $(CPU_CFLAGS) $(DEBUG_CFLAGS)
+CFLAGS = $(ARCH_FLAGS) $(CPU_CFLAGS) $(DEBUG_CFLAGS) $(SPEC_CFLAGS)
 
 #### Common LDFLAGS
 # These LDFLAGS are used as the first "ld" options, regardless of any library

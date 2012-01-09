@@ -151,6 +151,7 @@ static const struct cfg_opt cfg_opts2[] =
 	{ "independant-streams",          PR_O2_INDEPSTR,  PR_CAP_FE|PR_CAP_BE, 0, 0 },
 	{ "http-use-proxy-header",        PR_O2_USE_PXHDR, PR_CAP_FE, 0, PR_MODE_HTTP },
 	{ "http-pretend-keepalive",       PR_O2_FAKE_KA,   PR_CAP_FE|PR_CAP_BE, 0, PR_MODE_HTTP },
+	{ "http-no-delay",                PR_O2_NODELAY,   PR_CAP_FE|PR_CAP_BE, 0, PR_MODE_HTTP },
 	{ NULL, 0, 0, 0 }
 };
 
@@ -493,6 +494,14 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 		global.tune.maxaccept = atol(args[1]);
+	}
+	else if (!strcmp(args[0], "tune.chksize")) {
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects an integer argument.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		global.tune.chksize = atol(args[1]);
 	}
 	else if (!strcmp(args[0], "tune.bufsize")) {
 		if (*(args[1]) == 0) {
@@ -837,6 +846,37 @@ int cfg_parse_global(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
 	}
+	else if (!strcmp(args[0], "log-send-hostname")) { /* set the hostname in syslog header */
+		char *name;
+		int len;
+
+		if (global.log_send_hostname != NULL) {
+			Alert("parsing [%s:%d] : '%s' already specified. Continuing.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT;
+			goto out;
+		}
+
+		if (*(args[1]))
+			name = args[1];
+		else
+			name = hostname;
+
+		len = strlen(name);
+
+		/* We'll add a space after the name to respect the log format */
+		free(global.log_send_hostname);
+		global.log_send_hostname = malloc(len + 2);
+		snprintf(global.log_send_hostname, len + 2, "%s ", name);
+	}
+	else if (!strcmp(args[0], "log-tag")) {  /* tag to report to syslog */
+		if (*(args[1]) == 0) {
+			Alert("parsing [%s:%d] : '%s' expects a tag for use in syslog.\n", file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+		free(global.log_tag);
+		global.log_tag = strdup(args[1]);
+	}
 	else if (!strcmp(args[0], "spread-checks")) {  /* random time between checks (0-50) */
 		if (global.spread_checks != 0) {
 			Alert("parsing [%s:%d]: spread-checks already specified. Continuing.\n", file, linenum);
@@ -1112,8 +1152,8 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				new->conf.file = file;
 				new->conf.line = linenum;
 				new = new->next;
+				global.maxsock++;
 			}
-			global.maxsock++;
 		}
 
 		/* set default values */
@@ -1142,6 +1182,11 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			curproxy->orgto_hdr_name = strdup(defproxy.orgto_hdr_name);
 		}
 
+		if (defproxy.server_id_hdr_len) {
+			curproxy->server_id_hdr_len  = defproxy.server_id_hdr_len;
+			curproxy->server_id_hdr_name = strdup(defproxy.server_id_hdr_name);
+		}
+
 		if (curproxy->cap & PR_CAP_FE) {
 			curproxy->maxconn = defproxy.maxconn;
 			curproxy->backlog = defproxy.backlog;
@@ -1158,15 +1203,32 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			curproxy->fullconn = defproxy.fullconn;
 			curproxy->conn_retries = defproxy.conn_retries;
 
-			if (defproxy.check_req)
-				curproxy->check_req = strdup(defproxy.check_req);
+			if (defproxy.check_req) {
+				curproxy->check_req = calloc(1, defproxy.check_len);
+				memcpy(curproxy->check_req, defproxy.check_req, defproxy.check_len);
+			}
 			curproxy->check_len = defproxy.check_len;
+
+			if (defproxy.expect_str) {
+				curproxy->expect_str = strdup(defproxy.expect_str);
+				if (defproxy.expect_regex) {
+					/* note: this regex is known to be valid */
+					curproxy->expect_regex = calloc(1, sizeof(regex_t));
+					regcomp(curproxy->expect_regex, defproxy.expect_str, REG_EXTENDED);
+				}
+			}
 
 			if (defproxy.cookie_name)
 				curproxy->cookie_name = strdup(defproxy.cookie_name);
 			curproxy->cookie_len = defproxy.cookie_len;
 			if (defproxy.cookie_domain)
 				curproxy->cookie_domain = strdup(defproxy.cookie_domain);
+
+			if (defproxy.cookie_maxidle)
+				curproxy->cookie_maxidle = defproxy.cookie_maxidle;
+
+			if (defproxy.cookie_maxlife)
+				curproxy->cookie_maxlife = defproxy.cookie_maxlife;
 
 			if (defproxy.rdp_cookie_name)
 				 curproxy->rdp_cookie_name = strdup(defproxy.rdp_cookie_name);
@@ -1253,6 +1315,10 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 		defproxy.fwdfor_hdr_len = 0;
 		free(defproxy.orgto_hdr_name);
 		defproxy.orgto_hdr_len = 0;
+		free(defproxy.server_id_hdr_name);
+		defproxy.server_id_hdr_len = 0;
+		free(defproxy.expect_str);
+		if (defproxy.expect_regex) regfree(defproxy.expect_regex);
 
 		for (rc = 0; rc < HTTP_ERR_SIZE; rc++)
 			chunk_destroy(&defproxy.errmsg[rc]);
@@ -1301,6 +1367,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			new_listen->conf.file = file;
 			new_listen->conf.line = linenum;
 			new_listen = new_listen->next;
+			global.maxsock++;
 		}
 
 		cur_arg = 2;
@@ -1454,7 +1521,6 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
-		global.maxsock++;
 		goto out;
 	}
 	else if (!strcmp(args[0], "monitor-net")) {  /* set the range of IPs to ignore */
@@ -1641,11 +1707,14 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			goto out;
 		}
 
+		curproxy->options &= ~PR_O_COOK_ANY;
+		curproxy->options2 &= ~PR_O2_COOK_PSV;
+		curproxy->cookie_maxidle = curproxy->cookie_maxlife = 0;
 		free(curproxy->cookie_domain); curproxy->cookie_domain = NULL;
 		free(curproxy->cookie_name);
 		curproxy->cookie_name = strdup(args[1]);
 		curproxy->cookie_len = strlen(curproxy->cookie_name);
-	
+
 		cur_arg = 2;
 		while (*(args[cur_arg])) {
 			if (!strcmp(args[cur_arg], "rewrite")) {
@@ -1662,6 +1731,9 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			}
 			else if (!strcmp(args[cur_arg], "postonly")) {
 				curproxy->options |= PR_O_COOK_POST;
+			}
+			else if (!strcmp(args[cur_arg], "preserve")) {
+				curproxy->options2 |= PR_O2_COOK_PSV;
 			}
 			else if (!strcmp(args[cur_arg], "prefix")) {
 				curproxy->options |= PR_O_COOK_PFX;
@@ -1708,8 +1780,50 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 				}
 				cur_arg++;
 			}
+			else if (!strcmp(args[cur_arg], "maxidle")) {
+				unsigned int maxidle;
+				const char *res;
+
+				if (!*args[cur_arg + 1]) {
+					Alert("parsing [%s:%d]: '%s' expects <idletime> in seconds as argument.\n",
+						file, linenum, args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+				res = parse_time_err(args[cur_arg + 1], &maxidle, TIME_UNIT_S);
+				if (res) {
+					Alert("parsing [%s:%d]: unexpected character '%c' in argument to <%s>.\n",
+					      file, linenum, *res, args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				curproxy->cookie_maxidle = maxidle;
+				cur_arg++;
+			}
+			else if (!strcmp(args[cur_arg], "maxlife")) {
+				unsigned int maxlife;
+				const char *res;
+
+				if (!*args[cur_arg + 1]) {
+					Alert("parsing [%s:%d]: '%s' expects <lifetime> in seconds as argument.\n",
+						file, linenum, args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+
+				res = parse_time_err(args[cur_arg + 1], &maxlife, TIME_UNIT_S);
+				if (res) {
+					Alert("parsing [%s:%d]: unexpected character '%c' in argument to <%s>.\n",
+					      file, linenum, *res, args[cur_arg]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				curproxy->cookie_maxlife = maxlife;
+				cur_arg++;
+			}
 			else {
-				Alert("parsing [%s:%d] : '%s' supports 'rewrite', 'insert', 'prefix', 'indirect', 'nocache' and 'postonly', 'domain' options.\n",
+				Alert("parsing [%s:%d] : '%s' supports 'rewrite', 'insert', 'prefix', 'indirect', 'nocache', 'postonly', 'domain', 'maxidle, and 'maxlife' options.\n",
 				      file, linenum, args[0]);
 				err_code |= ERR_ALERT | ERR_FATAL;
 				goto out;
@@ -1724,6 +1838,12 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		if (!POWEROF2(curproxy->options & (PR_O_COOK_RW|PR_O_COOK_INS|PR_O_COOK_PFX))) {
 			Alert("parsing [%s:%d] : cookie 'rewrite', 'insert' and 'prefix' modes are incompatible.\n",
+			      file, linenum);
+			err_code |= ERR_ALERT | ERR_FATAL;
+		}
+
+		if ((curproxy->options2 & PR_O2_COOK_PSV) && !(curproxy->options & (PR_O_COOK_INS|PR_O_COOK_IND))) {
+			Alert("parsing [%s:%d] : cookie 'preserve' requires at least 'insert' or 'indirect'.\n",
 			      file, linenum);
 			err_code |= ERR_ALERT | ERR_FATAL;
 		}
@@ -1970,6 +2090,23 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		err_code |= warnif_cond_requires_resp(req_acl->cond, file, linenum);
 		LIST_ADDQ(&curproxy->req_acl, &req_acl->list);
+	}
+	else if (!strcmp(args[0], "http-send-name-header")) { /* send server name in request header */
+		/* set the header name and length into the proxy structure */
+		if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[0], NULL))
+			err_code |= ERR_WARN;
+
+		if (!*args[1]) {
+			Alert("parsing [%s:%d] : '%s' requires a header string.\n",
+			      file, linenum, args[0]);
+			err_code |= ERR_ALERT | ERR_FATAL;
+			goto out;
+		}
+
+		/* set the desired header name */
+		free(curproxy->server_id_hdr_name);
+		curproxy->server_id_hdr_name = strdup(args[1]);
+		curproxy->server_id_hdr_len  = strlen(curproxy->server_id_hdr_name);
 	}
 	else if (!strcmp(args[0], "block")) {  /* early blocking based on ACLs */
 		if (curproxy == &defproxy) {
@@ -2407,6 +2544,40 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 
 		if (!*args[1]) {
 			goto stats_error_parsing;
+		} else if (!strcmp(args[1], "admin")) {
+			struct stats_admin_rule *rule;
+
+			if (curproxy == &defproxy) {
+				Alert("parsing [%s:%d]: '%s %s' not allowed in 'defaults' section.\n", file, linenum, args[0], args[1]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			if (!stats_check_init_uri_auth(&curproxy->uri_auth)) {
+				Alert("parsing [%s:%d]: out of memory.\n", file, linenum);
+				err_code |= ERR_ALERT | ERR_ABORT;
+				goto out;
+			}
+
+			if (strcmp(args[2], "if") != 0 && strcmp(args[2], "unless") != 0) {
+				Alert("parsing [%s:%d] : '%s %s' requires either 'if' or 'unless' followed by a condition.\n",
+				file, linenum, args[0], args[1]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+			if ((cond = build_acl_cond(file, linenum, curproxy, (const char **)args + 2)) == NULL) {
+				Alert("parsing [%s:%d] : error detected while parsing a '%s %s' rule.\n",
+				file, linenum, args[0], args[1]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			err_code |= warnif_cond_requires_resp(cond, file, linenum);
+
+			rule = (struct stats_admin_rule *)calloc(1, sizeof(*rule));
+			rule->cond = cond;
+			LIST_INIT(&rule->list);
+			LIST_ADDQ(&curproxy->uri_auth->admin_rules, &rule->list);
 		} else if (!strcmp(args[1], "uri")) {
 			if (*(args[2]) == 0) {
 				Alert("parsing [%s:%d] : 'uri' needs an URI prefix.\n", file, linenum);
@@ -2569,7 +2740,7 @@ int cfg_parse_listen(const char *file, int linenum, char **args, int kwm)
 			}
 		} else {
 stats_error_parsing:
-			Alert("parsing [%s:%d]: %s '%s', expects 'uri', 'realm', 'auth', 'scope', 'enable', 'hide-version', 'show-node', 'show-desc' or 'show-legends'.\n",
+			Alert("parsing [%s:%d]: %s '%s', expects 'admin', 'uri', 'realm', 'auth', 'scope', 'enable', 'hide-version', 'show-node', 'show-desc' or 'show-legends'.\n",
 			      file, linenum, *args[1]?"unknown stats parameter":"missing keyword in", args[*args[1]?1:0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
@@ -2678,6 +2849,7 @@ stats_error_parsing:
 			curproxy->options &= ~PR_O_SMTP_CHK;
 			curproxy->options2 &= ~PR_O2_SSL3_CHK;
 			curproxy->options2 &= ~PR_O2_MYSQL_CHK;
+			curproxy->options2 &= ~PR_O2_LDAP_CHK;
 			curproxy->options |= PR_O_HTTP_CHK;
 			if (!*args[2]) { /* no argument */
 				curproxy->check_req = strdup(DEF_CHECK_REQ); /* default request */
@@ -2709,6 +2881,7 @@ stats_error_parsing:
 			curproxy->options &= ~PR_O_HTTP_CHK;
 			curproxy->options &= ~PR_O_SMTP_CHK;
 			curproxy->options2 &= ~PR_O2_MYSQL_CHK;
+			curproxy->options2 &= ~PR_O2_LDAP_CHK;
 			curproxy->options2 |= PR_O2_SSL3_CHK;
 		}
 		else if (!strcmp(args[1], "smtpchk")) {
@@ -2718,6 +2891,7 @@ stats_error_parsing:
 			curproxy->options &= ~PR_O_HTTP_CHK;
 			curproxy->options2 &= ~PR_O2_SSL3_CHK;
 			curproxy->options2 &= ~PR_O2_MYSQL_CHK;
+			curproxy->options2 &= ~PR_O2_LDAP_CHK;
 			curproxy->options |= PR_O_SMTP_CHK;
 
 			if (!*args[2] || !*args[3]) { /* no argument or incomplete EHLO host */
@@ -2739,12 +2913,90 @@ stats_error_parsing:
 		}
 		else if (!strcmp(args[1], "mysql-check")) {
 			/* use MYSQL request to check servers' health */
+			if (warnifnotcap(curproxy, PR_CAP_BE, file, linenum, args[1], NULL))
+				err_code |= ERR_WARN;
+
 			free(curproxy->check_req);
 			curproxy->check_req = NULL;
 			curproxy->options &= ~PR_O_HTTP_CHK;
 			curproxy->options &= ~PR_O_SMTP_CHK;
 			curproxy->options2 &= ~PR_O2_SSL3_CHK;
+			curproxy->options2 &= ~PR_O2_LDAP_CHK;
 			curproxy->options2 |= PR_O2_MYSQL_CHK;
+
+			/* This is an exemple of an MySQL >=4.0 client Authentication packet kindly provided by Cyril Bonte.
+			 * const char mysql40_client_auth_pkt[] = {
+			 * 	"\x0e\x00\x00"	// packet length
+			 * 	"\x01"		// packet number
+			 * 	"\x00\x00"	// client capabilities
+			 * 	"\x00\x00\x01"	// max packet
+			 * 	"haproxy\x00"	// username (null terminated string)
+			 * 	"\x00"		// filler (always 0x00)
+			 * 	"\x01\x00\x00"	// packet length
+			 * 	"\x00"		// packet number
+			 * 	"\x01"		// COM_QUIT command
+			 * };
+			 */
+
+			if (*(args[2])) {
+				int cur_arg = 2;
+
+				while (*(args[cur_arg])) {
+					if (strcmp(args[cur_arg], "user") == 0) {
+						char *mysqluser;
+						int packetlen, reqlen, userlen;
+
+						/* suboption header - needs additional argument for it */
+						if (*(args[cur_arg+1]) == 0) {
+							Alert("parsing [%s:%d] : '%s %s %s' expects <username> as argument.\n",
+							      file, linenum, args[0], args[1], args[cur_arg]);
+							err_code |= ERR_ALERT | ERR_FATAL;
+							goto out;
+						}
+						mysqluser = args[cur_arg + 1];
+						userlen   = strlen(mysqluser);
+						packetlen = userlen + 7;
+						reqlen    = packetlen + 9;
+
+						free(curproxy->check_req);
+						curproxy->check_req = (char *)calloc(1, reqlen);
+						curproxy->check_len = reqlen;
+
+						snprintf(curproxy->check_req, 4, "%c%c%c",
+							((unsigned char) packetlen & 0xff),
+							((unsigned char) (packetlen >> 8) & 0xff),
+							((unsigned char) (packetlen >> 16) & 0xff));
+
+						curproxy->check_req[3] = 1;
+						curproxy->check_req[5] = 128;
+						curproxy->check_req[8] = 1;
+						memcpy(&curproxy->check_req[9], mysqluser, userlen);
+						curproxy->check_req[9 + userlen + 1 + 1]     = 1;
+						curproxy->check_req[9 + userlen + 1 + 1 + 4] = 1;
+						cur_arg += 2;
+					} else {
+						/* unknown suboption - catchall */
+						Alert("parsing [%s:%d] : '%s %s' only supports optional values: 'user'.\n",
+						      file, linenum, args[0], args[1]);
+						err_code |= ERR_ALERT | ERR_FATAL;
+						goto out;
+					}
+				} /* end while loop */
+			}
+		}
+		else if (!strcmp(args[1], "ldap-check")) {
+			/* use LDAP request to check servers' health */
+			free(curproxy->check_req);
+			curproxy->check_req = NULL;
+			curproxy->options &= ~PR_O_HTTP_CHK;
+			curproxy->options &= ~PR_O_SMTP_CHK;
+			curproxy->options2 &= ~PR_O2_SSL3_CHK;
+			curproxy->options2 &= ~PR_O2_MYSQL_CHK;
+			curproxy->options2 |= PR_O2_LDAP_CHK;
+
+			curproxy->check_req = (char *) malloc(sizeof(DEF_LDAP_CHECK_REQ) - 1);
+			memcpy(curproxy->check_req, DEF_LDAP_CHECK_REQ, sizeof(DEF_LDAP_CHECK_REQ) - 1);
+			curproxy->check_len = sizeof(DEF_LDAP_CHECK_REQ) - 1;
 		}
 		else if (!strcmp(args[1], "forwardfor")) {
 			int cur_arg;
@@ -2754,6 +3006,7 @@ stats_error_parsing:
 			 */
 
 			curproxy->options |= PR_O_FWDFOR;
+			curproxy->options2 |= PR_O2_FF_ALWAYS;
 
 			free(curproxy->fwdfor_hdr_name);
 			curproxy->fwdfor_hdr_name = strdup(DEF_XFORWARDFOR_HDR);
@@ -2785,9 +3038,12 @@ stats_error_parsing:
 					curproxy->fwdfor_hdr_name = strdup(args[cur_arg+1]);
 					curproxy->fwdfor_hdr_len  = strlen(curproxy->fwdfor_hdr_name);
 					cur_arg += 2;
+				} else if (!strcmp(args[cur_arg], "if-none")) {
+					curproxy->options2 &= ~PR_O2_FF_ALWAYS;
+					cur_arg += 1;
 				} else {
 					/* unknown suboption - catchall */
-					Alert("parsing [%s:%d] : '%s %s' only supports optional values: 'except' and 'header'.\n",
+					Alert("parsing [%s:%d] : '%s %s' only supports optional values: 'except', 'header' and 'if-none'.\n",
 					      file, linenum, args[0], args[1]);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
@@ -2807,7 +3063,7 @@ stats_error_parsing:
 			curproxy->orgto_hdr_name = strdup(DEF_XORIGINALTO_HDR);
 			curproxy->orgto_hdr_len  = strlen(DEF_XORIGINALTO_HDR);
 
-			/* loop to go through arguments - start at 2, since 0+1 = "option" "forwardfor" */
+			/* loop to go through arguments - start at 2, since 0+1 = "option" "originalto" */
 			cur_arg = 2;
 			while (*(args[cur_arg])) {
 				if (!strcmp(args[cur_arg], "except")) {
@@ -2883,8 +3139,99 @@ stats_error_parsing:
 			/* enable emission of the apparent state of a server in HTTP checks */
 			curproxy->options2 |= PR_O2_CHK_SNDST;
 		}
+		else if (strcmp(args[1], "expect") == 0) {
+			const char *ptr_arg;
+			int cur_arg;
+
+			if (curproxy->options2 & PR_O2_EXP_TYPE) {
+				Alert("parsing [%s:%d] : '%s %s' already specified.\n", file, linenum, args[0], args[1]);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+
+			cur_arg = 2;
+			/* consider exclamation marks, sole or at the beginning of a word */
+			while (*(ptr_arg = args[cur_arg])) {
+				while (*ptr_arg == '!') {
+					curproxy->options2 ^= PR_O2_EXP_INV;
+					ptr_arg++;
+				}
+				if (*ptr_arg)
+					break;
+				cur_arg++;
+			}
+			/* now ptr_arg points to the beginning of a word past any possible
+			 * exclamation mark, and cur_arg is the argument which holds this word.
+			 */
+			if (strcmp(ptr_arg, "status") == 0) {
+				if (!*(args[cur_arg + 1])) {
+					Alert("parsing [%s:%d] : '%s %s %s' expects <string> as an argument.\n",
+					      file, linenum, args[0], args[1], ptr_arg);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				curproxy->options2 |= PR_O2_EXP_STS;
+				free(curproxy->expect_str);
+				curproxy->expect_str = strdup(args[cur_arg + 1]);
+			}
+			else if (strcmp(ptr_arg, "string") == 0) {
+				if (!*(args[cur_arg + 1])) {
+					Alert("parsing [%s:%d] : '%s %s %s' expects <string> as an argument.\n",
+					      file, linenum, args[0], args[1], ptr_arg);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				curproxy->options2 |= PR_O2_EXP_STR;
+				free(curproxy->expect_str);
+				curproxy->expect_str = strdup(args[cur_arg + 1]);
+			}
+			else if (strcmp(ptr_arg, "rstatus") == 0) {
+				if (!*(args[cur_arg + 1])) {
+					Alert("parsing [%s:%d] : '%s %s %s' expects <regex> as an argument.\n",
+					      file, linenum, args[0], args[1], ptr_arg);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				curproxy->options2 |= PR_O2_EXP_RSTS;
+				free(curproxy->expect_str);
+				if (curproxy->expect_regex) regfree(curproxy->expect_regex);
+				curproxy->expect_str = strdup(args[cur_arg + 1]);
+				curproxy->expect_regex = calloc(1, sizeof(regex_t));
+				if (regcomp(curproxy->expect_regex, args[cur_arg + 1], REG_EXTENDED) != 0) {
+					Alert("parsing [%s:%d] : '%s %s %s' : bad regular expression '%s'.\n",
+					      file, linenum, args[0], args[1], ptr_arg, args[cur_arg + 1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+			}
+			else if (strcmp(ptr_arg, "rstring") == 0) {
+				if (!*(args[cur_arg + 1])) {
+					Alert("parsing [%s:%d] : '%s %s %s' expects <regex> as an argument.\n",
+					      file, linenum, args[0], args[1], ptr_arg);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+				curproxy->options2 |= PR_O2_EXP_RSTR;
+				free(curproxy->expect_str);
+				if (curproxy->expect_regex) regfree(curproxy->expect_regex);
+				curproxy->expect_str = strdup(args[cur_arg + 1]);
+				curproxy->expect_regex = calloc(1, sizeof(regex_t));
+				if (regcomp(curproxy->expect_regex, args[cur_arg + 1], REG_EXTENDED) != 0) {
+					Alert("parsing [%s:%d] : '%s %s %s' : bad regular expression '%s'.\n",
+					      file, linenum, args[0], args[1], ptr_arg, args[cur_arg + 1]);
+					err_code |= ERR_ALERT | ERR_FATAL;
+					goto out;
+				}
+			}
+			else {
+				Alert("parsing [%s:%d] : '%s %s' only supports [!] 'status', 'string', 'rstatus', 'rstring', found '%s'.\n",
+				      file, linenum, args[0], args[1], ptr_arg);
+				err_code |= ERR_ALERT | ERR_FATAL;
+				goto out;
+			}
+		}
 		else {
-			Alert("parsing [%s:%d] : '%s' only supports 'disable-on-404'.\n", file, linenum, args[0]);
+			Alert("parsing [%s:%d] : '%s' only supports 'disable-on-404', 'send-state', 'expect'.\n", file, linenum, args[0]);
 			err_code |= ERR_ALERT | ERR_FATAL;
 			goto out;
 		}
@@ -3362,7 +3709,7 @@ stats_error_parsing:
 				}
 				else {
 					Alert("parsing [%s:%d]: '%s' expects one of 'none', "
-						"'l4events', 'http-responses' but get '%s'\n",
+						"'layer4', 'layer7' but got '%s'\n",
 						file, linenum, args[cur_arg], args[cur_arg + 1]);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
@@ -3381,7 +3728,7 @@ stats_error_parsing:
 					newsrv->onerror = HANA_ONERR_MARKDWN;
 				else {
 					Alert("parsing [%s:%d]: '%s' expects one of 'fastinter', "
-						"'fail-check', 'sudden-death' or 'mark-down' but get '%s'\n",
+						"'fail-check', 'sudden-death' or 'mark-down' but got '%s'\n",
 						file, linenum, args[cur_arg], args[cur_arg + 1]);
 					err_code |= ERR_ALERT | ERR_FATAL;
 					goto out;
@@ -3588,7 +3935,7 @@ stats_error_parsing:
 			}
 
 			if (!newsrv->check_port && newsrv->check_addr.sin_port)
-				newsrv->check_port = newsrv->check_addr.sin_port;
+				newsrv->check_port = htons(newsrv->check_addr.sin_port);
 
 			if (!newsrv->check_port && !(newsrv->state & SRV_MAPPORTS))
 				newsrv->check_port = realport; /* by default */
@@ -3615,7 +3962,7 @@ stats_error_parsing:
 			}
 
 			/* Allocate buffer for partial check results... */
-			if ((newsrv->check_data = calloc(BUFSIZE, sizeof(char))) == NULL) {
+			if ((newsrv->check_data = calloc(global.tune.chksize, sizeof(char))) == NULL) {
 				Alert("parsing [%s:%d] : out of memory while allocating check buffer.\n", file, linenum);
 				err_code |= ERR_ALERT | ERR_ABORT;
 				goto out;
@@ -5127,6 +5474,7 @@ out_uri_auth_compat:
 					"forwardfor", proxy_type_str(curproxy), curproxy->id);
 				err_code |= ERR_WARN;
 				curproxy->options &= ~PR_O_FWDFOR;
+				curproxy->options2 &= ~PR_O2_FF_ALWAYS;
 			}
 
 			if (curproxy->options & PR_O_ORGTO) {
@@ -5364,7 +5712,46 @@ out_uri_auth_compat:
 			listener = listener->next;
 		}
 
+		/* Check multi-process mode compatibility for the current proxy */
+		if (global.nbproc > 1) {
+			int nbproc = 0;
+			if (curproxy->bind_proc) {
+				int proc;
+				for (proc = 0; proc < global.nbproc; proc++) {
+					if (curproxy->bind_proc & (1 << proc)) {
+						nbproc++;
+					}
+				}
+			} else {
+				nbproc = global.nbproc;
+			}
+			if (nbproc > 1) {
+				if (curproxy->uri_auth) {
+					Warning("Proxy '%s': in multi-process mode, stats will be limited to process assigned to the current request.\n",
+						curproxy->id);
+					if (!LIST_ISEMPTY(&curproxy->uri_auth->admin_rules)) {
+						Warning("Proxy '%s': stats admin will not work correctly in multi-process mode.\n",
+							curproxy->id);
+					}
+				}
+				if (curproxy->appsession_name) {
+					Warning("Proxy '%s': appsession will not work correctly in multi-process mode.\n",
+						curproxy->id);
+				}
+				if (!LIST_ISEMPTY(&curproxy->sticking_rules)) {
+					Warning("Proxy '%s': sticking rules will not work correctly in multi-process mode.\n",
+						curproxy->id);
+				}
+			}
+		}
 		curproxy = curproxy->next;
+	}
+
+	/* Check multi-process mode compatibility */
+	if (global.nbproc > 1) {
+		if (global.stats_fe) {
+			Warning("stats socket will not work correctly in multi-process mode (nbproc > 1).\n");
+		}
 	}
 
 	for (curuserlist = userlist; curuserlist; curuserlist = curuserlist->next) {

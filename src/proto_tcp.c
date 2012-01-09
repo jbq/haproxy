@@ -1,7 +1,7 @@
 /*
  * AF_INET/AF_INET6 SOCK_STREAM protocol layer (tcp)
  *
- * Copyright 2000-2008 Willy Tarreau <w@1wt.eu>
+ * Copyright 2000-2010 Willy Tarreau <w@1wt.eu>
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -130,6 +130,7 @@ int tcpv4_bind_socket(int fd, int flags, struct sockaddr_in *local, struct socka
 #endif
 	if (flags) {
 		memset(&bind_addr, 0, sizeof(bind_addr));
+		bind_addr.sin_family = AF_INET;
 		if (flags & 1)
 			bind_addr.sin_addr = remote->sin_addr;
 		if (flags & 2)
@@ -239,7 +240,7 @@ int tcpv4_connect_server(struct stream_interface *si,
 		setsockopt(fd, SOL_SOCKET, SO_KEEPALIVE, (char *) &one, sizeof(one));
 
 	if (be->options & PR_O_TCP_NOLING)
-		setsockopt(fd, SOL_SOCKET, SO_LINGER, (struct linger *) &nolinger, sizeof(struct linger));
+		si->flags |= SI_FL_NOLINGER;
 
 	/* allow specific binding :
 	 * - server-specific at first
@@ -662,7 +663,7 @@ int tcp_inspect_request(struct session *s, struct buffer *req, int an_bit)
 	 * - if one rule returns KO, then return KO
 	 */
 
-	if (req->flags & BF_SHUTR || !s->fe->tcp_req.inspect_delay || tick_is_expired(req->analyse_exp, now_ms))
+	if (req->flags & (BF_SHUTR|BF_FULL) || !s->fe->tcp_req.inspect_delay || tick_is_expired(req->analyse_exp, now_ms))
 		partial = 0;
 	else
 		partial = ACL_PARTIAL;
@@ -796,7 +797,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 
 	if (!*args[1]) {
 		snprintf(err, errlen, "missing argument for '%s' in %s '%s'",
-			 args[0], proxy_type_str(proxy), curpx->id);
+			 args[0], proxy_type_str(curpx), curpx->id);
 		return -1;
 	}
 
@@ -809,7 +810,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 
 		if (!(curpx->cap & PR_CAP_FE)) {
 			snprintf(err, errlen, "%s %s will be ignored because %s '%s' has no %s capability",
-				 args[0], args[1], proxy_type_str(proxy), curpx->id,
+				 args[0], args[1], proxy_type_str(curpx), curpx->id,
 				 "frontend");
 			return 1;
 		}
@@ -817,7 +818,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 		if (!*args[2] || (ptr = parse_time_err(args[2], &val, TIME_UNIT_MS))) {
 			retlen = snprintf(err, errlen,
 					  "'%s %s' expects a positive delay in milliseconds, in %s '%s'",
-					  args[0], args[1], proxy_type_str(proxy), curpx->id);
+					  args[0], args[1], proxy_type_str(curpx), curpx->id);
 			if (ptr && retlen < errlen)
 				retlen += snprintf(err+retlen, errlen - retlen,
 						   " (unexpected character '%c')", *ptr);
@@ -826,7 +827,7 @@ static int tcp_parse_tcp_req(char **args, int section_type, struct proxy *curpx,
 
 		if (curpx->tcp_req.inspect_delay) {
 			snprintf(err, errlen, "ignoring %s %s (was already defined) in %s '%s'",
-				 args[0], args[1], proxy_type_str(proxy), curpx->id);
+				 args[0], args[1], proxy_type_str(curpx), curpx->id);
 			return 1;
 		}
 		curpx->tcp_req.inspect_delay = val;

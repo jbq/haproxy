@@ -2,9 +2,9 @@
                                  HAProxy
                           Configuration Manual
                          ----------------------
-                             version 1.4.8
+                             version 1.4.19
                              willy tarreau
-                              2010/06/16
+                               2012/01/08
 
 
 This document covers the configuration language as implemented in the version
@@ -414,7 +414,7 @@ for every keyword. Supported units are :
 
 Assuming haproxy is in $PATH, test these configurations in a shell with:
 
-    $ sudo haproxy -f configuration.conf -d
+    $ sudo haproxy -f configuration.conf -c
 
 
 3. Global parameters
@@ -432,6 +432,7 @@ The following keywords are supported in the "global" section :
    - gid
    - group
    - log
+   - log-send-hostname
    - nbproc
    - pidfile
    - uid
@@ -451,6 +452,7 @@ The following keywords are supported in the "global" section :
    - nosplice
    - spread-checks
    - tune.bufsize
+   - tune.chksize
    - tune.maxaccept
    - tune.maxpollevents
    - tune.maxrewrite
@@ -522,6 +524,19 @@ log <address> <facility> [max level [min level]]
 
 	  emerg  alert  crit   err    warning notice info  debug
 
+log-send-hostname [<string>]
+  Sets the hostname field in the syslog header. If optional "string" parameter
+  is set the header is set to the string contents, otherwise uses the hostname
+  of the system. Generally used if one is not relaying logs through an
+  intermediate syslog server or for simply customizing the hostname printed in
+  the logs.
+
+log-tag <string>
+  Sets the tag field in the syslog header to this string. It defaults to the
+  program name as launched from the command line, which usually is "haproxy".
+  Sometimes it can be useful to differentiate between multiple processes
+  running on the same host.
+
 nbproc <number>
   Creates <number> processes when going daemon. This requires the "daemon"
   mode. By default, only one process is created, which is the recommended mode
@@ -549,7 +564,7 @@ stats socket <path> [{uid | user} <uid>] [{gid | group} <gid>] [mode <mode>]
       is not easy to restrict access to the socket.
 
     - "operator" is the default level and fits most common uses. All data can
-      be read, and only non-sensible changes are permitted (eg: clear max
+      be read, and only non-sensitive changes are permitted (eg: clear max
       counters).
 
     - "admin" should be used with care, as everything is permitted (eg: clear
@@ -668,6 +683,13 @@ tune.bufsize <number>
   statistics, and values larger than default size will increase memory usage,
   possibly causing the system to run out of memory. At least the global maxconn
   parameter should be decreased by the same factor as this one is increased.
+
+tune.chksize <number>
+  Sets the check buffer size to this size (in bytes). Higher values may help
+  find string or regex patterns in very large pages, though doing so may imply
+  more memory and CPU usage. The default value is 16384 and can be changed at
+  build time. It is not recommended to change this value, but to use better
+  checks whenever possible.
 
 tune.maxaccept <number>
   Sets the maximum number of consecutive accepts that a process may perform on
@@ -865,6 +887,8 @@ fullconn                                  X          -         X         X
 grace                                     X          X         X         X
 hash-type                                 X          -         X         X
 http-check disable-on-404                 X          -         X         X
+http-check expect                         -          -         X         X
+http-check send-state                     X          -         X         X
 http-request                              -          X         X         X
 id                                        -          X         X         X
 ignore-persist                            -          X         X         X
@@ -886,6 +910,7 @@ option dontlognull                   (*)  X          X         X         -
 option forceclose                    (*)  X          X         X         X
 -- keyword -------------------------- defaults - frontend - listen -- backend -
 option forwardfor                         X          X         X         X
+option http-no-delay                 (*)  X          X         X         X
 option http-pretend-keepalive        (*)  X          X         X         X
 option http-server-close             (*)  X          X         X         X
 option http-use-proxy-header         (*)  X          X         X         -
@@ -894,6 +919,7 @@ option httpclose                     (*)  X          X         X         X
 option httplog                            X          X         X         X
 option http_proxy                    (*)  X          X         X         X
 option independant-streams           (*)  X          X         X         X
+option ldap-check                         X          -         X         X
 option log-health-checks             (*)  X          -         X         X
 option log-separate-errors           (*)  X          X         X         -
 option logasap                       (*)  X          X         X         -
@@ -947,9 +973,11 @@ rsprep                                    -          X         X         X
 server                                    -          -         X         X
 source                                    X          -         X         X
 srvtimeout                  (deprecated)  X          -         X         X
+stats admin                               -          -         X         X
 stats auth                                X          -         X         X
 stats enable                              X          -         X         X
 stats hide-version                        X          -         X         X
+stats http-request                        -          -         X         X
 stats realm                               X          -         X         X
 stats refresh                             X          -         X         X
 stats scope                               X          -         X         X
@@ -1057,11 +1085,15 @@ appsession <cookie> len <length> timeout <holdtime>
 
   The definition of an application cookie is limited to one per backend.
 
+  Note : Consider not using this feature in multi-process mode (nbproc > 1)
+         unless you know what you do : memory is not shared between the
+         processes, which can result in random behaviours.
+
   Example :
         appsession JSESSIONID len 52 timeout 3h
 
-  See also : "cookie", "capture cookie", "balance", "stick", "stick-table"
-             and "ignore-persist"
+  See also : "cookie", "capture cookie", "balance", "stick", "stick-table",
+             "ignore-persist", "nbproc" and "bind-process".
 
 
 backlog <conns>
@@ -1175,8 +1207,8 @@ balance url_param <param> [check_post [<max_wait>]]
 
                   If the modifier "check_post" is used, then an HTTP POST
 		  request entity will be searched for the parameter argument,
-		  when the question mark indicating a query string ('?') is not
-		  present in the URL. Optionally, specify a number of octets to
+		  when it is not found in a query string after a question mark
+		  ('?') in the URL. Optionally, specify a number of octets to
 		  wait for before attempting to search the message body. If the
 		  entity can not be searched, then round robin is used for each
 		  request. For instance, if your clients always send the LB
@@ -1371,7 +1403,7 @@ bind [<address>]:<port_range> [, ...] defer-accept
                   the specified port. This keyword is available only when
                   HAProxy is built with USE_LINUX_TPROXY=1.
 
-    defer_accept  is an optional keyword which is supported only on certain
+    defer-accept  is an optional keyword which is supported only on certain
                   Linux kernels. It states that a connection will only be
                   accepted once some data arrive on it, or at worst after the
                   first retransmit. This should be used only on protocols for
@@ -1437,15 +1469,15 @@ bind-process [ all | odd | even | <number 1-32> ] ...
   Example :
         listen app_ip1
             bind 10.0.0.1:80
-            bind_process odd
+            bind-process odd
 
         listen app_ip2
             bind 10.0.0.2:80
-            bind_process even
+            bind-process even
 
         listen management
             bind 10.0.0.3:80
-            bind_process 1 2 3 4
+            bind-process 1 2 3 4
 
   See also : "nbproc" in global section.
 
@@ -1458,7 +1490,7 @@ block { if | unless } <condition>
   The HTTP request will be blocked very early in the layer 7 processing
   if/unless <condition> is matched. A 403 error will be returned if the request
   is blocked. The condition has to reference ACLs (see section 7). This is
-  typically used to deny access to certain sensible resources if some
+  typically used to deny access to certain sensitive resources if some
   conditions are met or not met. There is no fixed limit to the number of
   "block" statements per instance.
 
@@ -1659,7 +1691,8 @@ contimeout <timeout> (deprecated)
 
 
 cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
-              [ postonly ] [ domain <domain> ]*
+              [ postonly ] [ preserve ] [ domain <domain> ]*
+              [ maxidle <idle> ] [ maxlife <life> ]
   Enable cookie-based persistence in a backend.
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    no    |   yes  |   yes
@@ -1687,14 +1720,19 @@ cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
               "insert" and "prefix".
 
     insert    This keyword indicates that the persistence cookie will have to
-              be inserted by haproxy in the responses. If the server emits a
-              cookie with the same name, it will be replaced anyway. For this
-              reason, this mode can be used to upgrade existing configurations
-              running in the "rewrite" mode. The cookie will only be a session
-              cookie and will not be stored on the client's disk. Due to
-              caching effects, it is generally wise to add the "indirect" and
-              "nocache" or "postonly" keywords (see below). The "insert"
-              keyword is not compatible with "rewrite" and "prefix".
+              be inserted by haproxy in server responses if the client did not
+
+              already have a cookie that would have permitted it to access this
+              server. When used without the "preserve" option, if the server
+              emits a cookie with the same name, it will be remove before
+              processing.  For this reason, this mode can be used to upgrade
+              existing configurations running in the "rewrite" mode. The cookie
+              will only be a session cookie and will not be stored on the
+              client's disk. By default, unless the "indirect" option is added,
+              the server will see the cookies emitted by the client. Due to
+              caching effects, it is generally wise to add the "nocache" or
+              "postonly" keywords (see below). The "insert" keyword is not
+              compatible with "rewrite" and "prefix".
 
     prefix    This keyword indicates that instead of relying on a dedicated
               cookie for the persistence, an existing one will be completed.
@@ -1708,16 +1746,13 @@ cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
               this mode requires the HTTP close mode. The "prefix" keyword is
               not compatible with "rewrite" and "insert".
 
-    indirect  When this option is specified in insert mode, cookies will only
-              be added when the server was not reached after a direct access,
-              which means that only when a server is elected after applying a
-              load-balancing algorithm, or after a redispatch, then the cookie
-              will be inserted. If the client has all the required information
-              to connect to the same server next time, no further cookie will
-              be inserted. In all cases, when the "indirect" option is used in
-              insert mode, the cookie is always removed from the requests
-              transmitted to the server. The persistence mechanism then becomes
-              totally transparent from the application point of view.
+    indirect  When this option is specified, no cookie will be emitted to a
+              client which already has a valid one for the server which has
+              processed the request. If the server sets such a cookie itself,
+              it will be removed, unless the "preserve" option is also set. In
+              "insert" mode, this will additionally remove cookies from the
+              requests transmitted to the server, making the persistence
+              mechanism totally transparent from an application point of view.
 
     nocache   This option is recommended in conjunction with the insert mode
               when there is a cache between the client and HAProxy, as it
@@ -1739,6 +1774,17 @@ cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
               persistence cookie in the cache.
               See also the "insert" and "nocache" options.
 
+    preserve  This option may only be used with "insert" and/or "indirect". It
+              allows the server to emit the persistence cookie itself. In this
+              case, if a cookie is found in the response, haproxy will leave it
+              untouched. This is useful in order to end persistence after a
+              logout request for instance. For this, the server just has to
+              emit a cookie with an invalid value (eg: empty) or with a date in
+              the past. By combining this mechanism with the "disable-on-404"
+              check option, it is possible to perform a completely graceful
+              shutdown because users will definitely leave the server after
+              they logout.
+
     domain    This option allows to specify the domain at which a cookie is
               inserted. It requires exactly one parameter: a valid domain
               name. If the domain begins with a dot, the browser is allowed to
@@ -1747,6 +1793,39 @@ cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
               times. Some browsers might have small limits on the number of
               domains, so be careful when doing that. For the record, sending
               10 domains to MSIE 6 or Firefox 2 works as expected.
+
+    maxidle   This option allows inserted cookies to be ignored after some idle
+              time. It only works with insert-mode cookies. When a cookie is
+              sent to the client, the date this cookie was emitted is sent too.
+              Upon further presentations of this cookie, if the date is older
+              than the delay indicated by the parameter (in seconds), it will
+              be ignored. Otherwise, it will be refreshed if needed when the
+              response is sent to the client. This is particularly useful to
+              prevent users who never close their browsers from remaining for
+              too long on the same server (eg: after a farm size change). When
+              this option is set and a cookie has no date, it is always
+              accepted, but gets refreshed in the response. This maintains the
+              ability for admins to access their sites. Cookies that have a
+              date in the future further than 24 hours are ignored. Doing so
+              lets admins fix timezone issues without risking kicking users off
+              the site.
+
+    maxlife   This option allows inserted cookies to be ignored after some life
+              time, whether they're in use or not. It only works with insert
+              mode cookies. When a cookie is first sent to the client, the date
+              this cookie was emitted is sent too. Upon further presentations
+              of this cookie, if the date is older than the delay indicated by
+              the parameter (in seconds), it will be ignored. If the cookie in
+              the request has no date, it is accepted and a date will be set.
+              Cookies that have a date in the future further than 24 hours are
+              ignored. Doing so lets admins fix timezone issues without risking
+              kicking users off the site. Contrary to maxidle, this value is
+              not refreshed, only the first visit date counts. Both maxidle and
+              maxlife may be used at the time. This is particularly useful to
+              prevent users who never close their browsers from remaining for
+              too long on the same server (eg: after a farm size change). This
+              is stronger than the maxidle method in that it forces a
+              redispatch after some absolute delay.
 
   There can be only one persistence cookie per HTTP backend, and it can be
   declared in a defaults section. The value of the cookie will be the value
@@ -1757,6 +1836,7 @@ cookie <name> [ rewrite | insert | prefix ] [ indirect ] [ nocache ]
         cookie JSESSIONID prefix
         cookie SRV insert indirect nocache
         cookie SRV insert postonly indirect
+        cookie SRV insert indirect nocache maxidle 30m maxlife 8h
 
   See also : "appsession", "balance source", "capture cookie", "server"
              and "ignore-persist".
@@ -1830,7 +1910,7 @@ dispatch <address>:<port>
               to this port, and it is not permitted to use port offsets as is
               possible with normal servers.
 
-  The "disabled" keyword designates a default server for use when no other
+  The "dispatch" keyword designates a default server for use when no other
   server can take the connection. In the past it was used to forward non
   persistent connections to an auxiliary load balancer. Due to its simple
   syntax, it has also been used for simple TCP relays. It is recommended not to
@@ -1857,7 +1937,7 @@ errorfile <code> <file>
                                  yes   |    yes   |   yes  |   yes
   Arguments :
     <code>    is the HTTP status code. Currently, HAProxy is capable of
-              generating codes 400, 403, 408, 500, 502, 503, and 504.
+              generating codes 200, 400, 403, 408, 500, 502, 503, and 504.
 
     <file>    designates a file containing the full HTTP response. It is
               recommended to follow the common practice of appending ".http" to
@@ -1868,6 +1948,8 @@ errorfile <code> <file>
   It is important to understand that this keyword is not meant to rewrite
   errors returned by the server, but errors detected and returned by HAProxy.
   This is why the list of supported errors is limited to a small set.
+
+  Code 200 is emitted in response to requests matching a "monitor-uri" rule.
 
   The files are returned verbatim on the TCP socket. This allows any trick such
   as redirections to another URL or site, as well as tricks to clean cookies,
@@ -1902,7 +1984,7 @@ errorloc302 <code> <url>
                                  yes   |    yes   |   yes  |   yes
   Arguments :
     <code>    is the HTTP status code. Currently, HAProxy is capable of
-              generating codes 400, 403, 408, 500, 502, 503, and 504.
+              generating codes 200, 400, 403, 408, 500, 502, 503, and 504.
 
     <url>     it is the exact contents of the "Location" header. It may contain
               either a relative URI to an error page hosted on the same site,
@@ -1913,6 +1995,8 @@ errorloc302 <code> <url>
   It is important to understand that this keyword is not meant to rewrite
   errors returned by the server, but errors detected and returned by HAProxy.
   This is why the list of supported errors is limited to a small set.
+
+  Code 200 is emitted in response to requests matching a "monitor-uri" rule.
 
   Note that both keyword return the HTTP 302 status code, which tells the
   client to fetch the designated URL using the same HTTP method. This can be
@@ -1942,6 +2026,8 @@ errorloc303 <code> <url>
   It is important to understand that this keyword is not meant to rewrite
   errors returned by the server, but errors detected and returned by HAProxy.
   This is why the list of supported errors is limited to a small set.
+
+  Code 200 is emitted in response to requests matching a "monitor-uri" rule.
 
   Note that both keyword return the HTTP 303 status code, which tells the
   client to fetch the designated URL using the same HTTP GET method. This
@@ -2078,9 +2164,93 @@ http-check disable-on-404
   generate an alert, just a notice. If the server responds 2xx or 3xx again, it
   will immediately be reinserted into the farm. The status on the stats page
   reports "NOLB" for a server in this mode. It is important to note that this
-  option only works in conjunction with the "httpchk" option.
+  option only works in conjunction with the "httpchk" option. If this option
+  is used with "http-check expect", then it has precedence over it so that 404
+  responses will still be considered as soft-stop.
 
-  See also : "option httpchk"
+  See also : "option httpchk", "http-check expect"
+
+
+http-check expect [!] <match> <pattern>
+  Make HTTP health checks consider reponse contents or specific status codes
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    no    |   yes  |   yes
+  Arguments :
+    <match>   is a keyword indicating how to look for a specific pattern in the
+              response. The keyword may be one of "status", "rstatus",
+	      "string", or "rstring". The keyword may be preceeded by an
+              exclamation mark ("!") to negate the match. Spaces are allowed
+              between the exclamation mark and the keyword. See below for more
+              details on the supported keywords.
+
+    <pattern> is the pattern to look for. It may be a string or a regular
+              expression. If the pattern contains spaces, they must be escaped
+              with the usual backslash ('\').
+
+  By default, "option httpchk" considers that response statuses 2xx and 3xx
+  are valid, and that others are invalid. When "http-check expect" is used,
+  it defines what is considered valid or invalid. Only one "http-check"
+  statement is supported in a backend. If a server fails to respond or times
+  out, the check obviously fails. The available matches are :
+
+    status <string> : test the exact string match for the HTTP status code.
+                      A health check respose will be considered valid if the
+                      response's status code is exactly this string. If the
+                      "status" keyword is prefixed with "!", then the response
+                      will be considered invalid if the status code matches.
+
+    rstatus <regex> : test a regular expression for the HTTP status code.
+                      A health check respose will be considered valid if the
+                      response's status code matches the expression. If the
+                      "rstatus" keyword is prefixed with "!", then the response
+                      will be considered invalid if the status code matches.
+                      This is mostly used to check for multiple codes.
+
+    string <string> : test the exact string match in the HTTP response body.
+                      A health check respose will be considered valid if the
+                      response's body contains this exact string. If the
+                      "string" keyword is prefixed with "!", then the response
+                      will be considered invalid if the body contains this
+                      string. This can be used to look for a mandatory word at
+                      the end of a dynamic page, or to detect a failure when a
+                      specific error appears on the check page (eg: a stack
+                      trace).
+
+    rstring <regex> : test a regular expression on the HTTP response body.
+                      A health check respose will be considered valid if the
+                      response's body matches this expression. If the "rstring"
+                      keyword is prefixed with "!", then the response will be
+                      considered invalid if the body matches the expression.
+                      This can be used to look for a mandatory word at the end
+                      of a dynamic page, or to detect a failure when a specific
+                      error appears on the check page (eg: a stack trace).
+
+  It is important to note that the responses will be limited to a certain size
+  defined by the global "tune.chksize" option, which defaults to 16384 bytes.
+  Thus, too large responses may not contain the mandatory pattern when using
+  "string" or "rstring". If a large response is absolutely required, it is
+  possible to change the default max size by setting the global variable.
+  However, it is worth keeping in mind that parsing very large responses can
+  waste some CPU cycles, especially when regular expressions are used, and that
+  it is always better to focus the checks on smaller resources.
+
+  Last, if "http-check expect" is combined with "http-check disable-on-404",
+  then this last one has precedence when the server responds with 404.
+
+  Examples :
+         # only accept status 200 as valid
+         http-check expect status 200
+
+         # consider SQL errors as errors
+         http-check expect ! string SQL\ Error
+
+         # consider status 5xx only as errors
+         http-check expect ! rstatus ^5
+
+         # check that we have a correct hexadecimal tag before /html
+         http-check expect rstring <!--tag:[0-9a-f]*</html>
+
+  See also : "option httpchk", "http-check disable-on-404"
 
 
 http-check send-state
@@ -2125,7 +2295,7 @@ http-check send-state
 
   See also : "option httpchk", "http-check disable-on-404"
 
-http-request { allow | deny | http-auth [realm <realm>] }
+http-request { allow | deny | auth [realm <realm>] }
              [ { if | unless } <condition> ]
   Access control for Layer 7 requests
 
@@ -2135,8 +2305,8 @@ http-request { allow | deny | http-auth [realm <realm>] }
   These set of options allow to fine control access to a
   frontend/listen/backend. Each option may be followed by if/unless and acl.
   First option with matched condition (or option without condition) is final.
-  For "block" a 403 error will be returned, for "allow" normal processing is
-  performed, for "http-auth" a 401/407 error code is returned so the client
+  For "deny" a 403 error will be returned, for "allow" normal processing is
+  performed, for "auth" a 401/407 error code is returned so the client
   should be asked to enter a username and password.
 
   There is no fixed limit to the number of http-request statements per
@@ -2157,7 +2327,24 @@ http-request { allow | deny | http-auth [realm <realm>] }
 
         http-request auth unless auth_ok
 
-  See section 3.4 about userlists and 7 about ACL usage.
+  See also : "stats http-request", section 3.4 about userlists and section 7
+             about ACL usage.
+
+http-send-name-header [<header>]
+  Add the server name to a request. Use the header string given by <header>
+
+  May be used in sections:   defaults | frontend | listen | backend
+                               yes    |    no    |   yes  |   yes
+
+  Arguments :
+
+    <header>  The header string to use to send the server name
+
+  The "http-send-name-header" statement causes the name of the target
+  server to be added to the headers of an HTTP request.  The name
+  is added with the header string proved.
+
+  See also : "server"
 
 id <value>
   Set a persistent ID to a proxy.
@@ -2342,7 +2529,8 @@ monitor fail { if | unless } <condition>
   very useful to report a site failure to an external component which may base
   routing advertisements between multiple sites on the availability reported by
   haproxy. In this case, one would rely on an ACL involving the "nbsrv"
-  criterion. Note that "monitor fail" only works in HTTP mode.
+  criterion. Note that "monitor fail" only works in HTTP mode. Both status
+  messages may be tweaked using "errorfile" or "errorloc" if needed.
 
   Example:
      frontend www
@@ -2352,7 +2540,7 @@ monitor fail { if | unless } <condition>
         monitor-uri   /site_alive
         monitor fail  if site_dead
 
-  See also : "monitor-net", "monitor-uri"
+  See also : "monitor-net", "monitor-uri", "errorfile", "errorloc"
 
 
 monitor-net <source>
@@ -2571,7 +2759,7 @@ no option checkcache
   be cached. When a session cookie is returned on a cacheable object, there is a
   high risk of session crossing or stealing between users traversing the same
   caches. In some situations, it is better to block the response than to let
-  some sensible session information go in the wild.
+  some sensitive session information go in the wild.
 
   The option "checkcache" enables deep inspection of all server responses for
   strict compliance with HTTP specification in terms of cacheability. It
@@ -2737,7 +2925,7 @@ no option forceclose
   See also : "option httpclose" and "option http-pretend-keepalive"
 
 
-option forwardfor [ except <network> ] [ header <name> ]
+option forwardfor [ except <network> ] [ header <name> ] [ if-none ]
   Enable insertion of the X-Forwarded-For header to requests sent to servers
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    yes   |   yes  |   yes
@@ -2773,15 +2961,23 @@ option forwardfor [ except <network> ] [ header <name> ]
   network will not cause an addition of this header. Most common uses are with
   private networks or 127.0.0.1.
 
+  Alternatively, the keyword "if-none" states that the header will only be
+  added if it is not present. This should only be used in perfectly trusted
+  environment, as this might cause a security issue if headers reaching haproxy
+  are under the control of the end-user.
+
   This option may be specified either in the frontend or in the backend. If at
   least one of them uses it, the header will be added. Note that the backend's
   setting of the header subargument takes precedence over the frontend's if
-  both are defined.
+  both are defined. In the case of the "if-none" argument, if at least one of
+  the frontend or the backend does not specify it, it wants the addition to be
+  mandatory, so it wins.
 
-  It is important to note that as long as HAProxy does not support keep-alive
-  connections, only the first request of a connection will receive the header.
-  For this reason, it is important to ensure that "option httpclose" is set
-  when using this option.
+  It is important to note that by default, HAProxy works in tunnel mode and
+  only inspects the first request of a connection, meaning that only the first
+  request will have the header appended, which is certainly not what you want.
+  In order to fix this, ensure that any of the "httpclose", "forceclose" or
+  "http-server-close" options is set when using this option.
 
   Examples :
     # Public HTTP address also used by stunnel on the same machine
@@ -2794,7 +2990,40 @@ option forwardfor [ except <network> ] [ header <name> ]
         mode http
         option forwardfor header X-Client
 
-  See also : "option httpclose"
+  See also : "option httpclose", "option http-server-close",
+             "option forceclose"
+
+
+option http-no-delay
+no option http-no-delay
+  Instruct the system to favor low interactive delays over performance in HTTP
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    yes   |   yes  |   yes
+  Arguments : none
+
+  In HTTP, each payload is unidirectional and has no notion of interactivity.
+  Any agent is expected to queue data somewhat for a reasonably low delay.
+  There are some very rare server-to-server applications that abuse the HTTP
+  protocol and expect the payload phase to be highly interactive, with many
+  interleaved data chunks in both directions within a single request. This is
+  absolutely not supported by the HTTP specification and will not work across
+  most proxies or servers. When such applications attempt to do this through
+  haproxy, it works but they will experience high delays due to the network
+  optimizations which favor performance by instructing the system to wait for
+  enough data to be available in order to only send full packets. Typical
+  delays are around 200 ms per round trip. Note that this only happens with
+  abnormal uses. Normal uses such as CONNECT requests nor WebSockets are not
+  affected.
+
+  When "option http-no-delay" is present in either the frontend or the backend
+  used by a connection, all such optimizations will be disabled in order to
+  make the exchanges as fast as possible. Of course this offers no guarantee on
+  the functionality, as it may break at any other place. But if it works via
+  HAProxy, it will work as fast as possible. This option should never be used
+  by default, and should never be used at all unless such a buggy application
+  is discovered. The impact of using this option is an increase of bandwidth
+  usage and CPU usage, which may significantly lower performance in high
+  latency environments.
 
 
 option http-pretend-keepalive
@@ -2830,8 +3059,9 @@ no option http-pretend-keepalive
 
   This option may be set both in a frontend and in a backend. It is enabled if
   at least one of the frontend or backend holding a connection has it enabled.
-  This option has no effect if it is combined with "option httpclose", which
-  has precedence.
+  This option may be compbined with "option httpclose", which will cause
+  keepalive to be announced to the server and close to be announced to the
+  client. This practice is discouraged though.
 
   If this option has been enabled in a "defaults" section, it can be disabled
   in a specific instance by prepending the "no" keyword before it.
@@ -3043,7 +3273,7 @@ no option http_proxy
   addresses are passed. Since this option's usage perimeter is rather limited,
   it will probably be used only by experts who know they need exactly it. Last,
   if the clients are susceptible of sending keep-alive requests, it will be
-  needed to add "option http_close" to ensure that all requests will correctly
+  needed to add "option httpclose" to ensure that all requests will correctly
   be analyzed.
 
   If this option has been enabled in a "defaults" section, it can be disabled
@@ -3056,30 +3286,6 @@ no option http_proxy
         option http_proxy
 
   See also : "option httpclose"
-
-
-option ignore-persist { if | unless } <condition>
-  Declare a condition to ignore persistence
-  May be used in sections:    defaults | frontend | listen | backend
-                                  no   |    yes   |   yes  |   yes
-
-  By default, when cookie persistence is enabled, every requests containing
-  the cookie are unconditionally persistent (assuming the target server is up
-  and running).
-
-  The "ignore-persist" statement allows one to declare various ACL-based
-  conditions which, when met, will cause a request to ignore persistence.
-  This is sometimes useful to load balance requests for static files, which
-  oftenly don't require persistence. This can also be used to fully disable
-  persistence for a specific User-Agent (for example, some web crawler bots).
-
-  Combined with "appsession", it can also help reduce HAProxy memory usage, as
-  the appsession table won't grow if persistence is ignored.
-
-  The persistence is ignored when an "if" condition is met, or unless an
-  "unless" condition is met.
-
-  See also : "option force-persist", "cookie", and section 7 about ACL usage.
 
 
 option independant-streams
@@ -3113,6 +3319,29 @@ no option independant-streams
   slow lines, so use it with caution.
 
   See also : "timeout client" and "timeout server"
+
+
+option ldap-check
+  Use LDAPv3 health checks for server testing
+  May be used in sections :   defaults | frontend | listen | backend
+                                 yes   |    no    |   yes  |   yes
+  Arguments : none
+
+  It is possible to test that the server correctly talks LDAPv3 instead of just
+  testing that it accepts the TCP connection. When this option is set, an
+  LDAPv3 anonymous simple bind message is sent to the server, and the response
+  is analyzed to find an LDAPv3 bind response message.
+
+  The server is considered valid only when the LDAP response contains success
+  resultCode (http://tools.ietf.org/html/rfc4511#section-4.1.9).
+
+  Logging of bind requests is server dependent see your documentation how to
+  configure it.
+
+  Example :
+        option ldap-check
+
+  See also : "option httpchk"
 
 
 option log-health-checks
@@ -3190,17 +3419,39 @@ no option logasap
              logging.
 
 
-option mysql-check
-  Use Mysql health checks for server testing
+option mysql-check [ user <username> ]
+  Use MySQL health checks for server testing
   May be used in sections :   defaults | frontend | listen | backend
                                  yes   |    no    |   yes  |   yes
-  Arguments : none
+  Arguments :
+    user <username> This is the username which will be used when connecting
+    to MySQL server.
 
-  The check consists in parsing Mysql Handshake Initialisation packet or Error
-  packet, which is sent by MySQL server on connect. It is a basic but useful
-  test which does not produce any logging on the server. However, it does not
-  check database presence nor database consistency, nor user permission to
-  access. To do this, you can use an external check with xinetd for example.
+  If you specify a username, the check consists of sending two MySQL packet,
+  one Client Authentication packet, and one QUIT packet, to correctly close
+  MySQL session. We then parse the MySQL Handshake Initialisation packet and/or
+  Error packet. It is a basic but useful test which does not produce error nor
+  aborted connect on the server. However, it requires adding an authorization
+  in the MySQL table, like this :
+
+      USE mysql;
+      INSERT INTO user (Host,User) values ('<ip_of_haproxy>','<username>');
+      FLUSH PRIVILEGES;
+
+  If you don't specify a username (it is deprecated and not recommended), the
+  check only consists in parsing the Mysql Handshake Initialisation packet or
+  Error packet, we don't send anything in this mode. It was reported that it
+  can generate lockout if check is too frequent and/or if there is not enough
+  traffic. In fact, you need in this case to check MySQL "max_connect_errors"
+  value as if a connection is established successfully within fewer than MySQL
+  "max_connect_errors" attempts after a previous connection was interrupted,
+  the error count for the host is cleared to zero. If HAProxy's server get
+  blocked, the "FLUSH HOSTS" statement is the only way to unblock it.
+
+  Remember that this does not check database presence nor database consistency.
+  To do this, you can use an external check with xinetd for example.
+
+  The check requires MySQL >=3.22, for older version, please use TCP check.
 
   Most often, an incoming MySQL server needs to see the client's IP address for
   various purposes, including IP privilege matching and connection logging.
@@ -3284,10 +3535,11 @@ option originalto [ except <network> ] [ header <name> ]
   setting of the header subargument takes precedence over the frontend's if
   both are defined.
 
-  It is important to note that as long as HAProxy does not support keep-alive
-  connections, only the first request of a connection will receive the header.
-  For this reason, it is important to ensure that "option httpclose" is set
-  when using this option.
+  It is important to note that by default, HAProxy works in tunnel mode and
+  only inspects the first request of a connection, meaning that only the first
+  request will have the header appended, which is certainly not what you want.
+  In order to fix this, ensure that any of the "httpclose", "forceclose" or
+  "http-server-close" options is set when using this option.
 
   Examples :
     # Original Destination address
@@ -3300,7 +3552,8 @@ option originalto [ except <network> ] [ header <name> ]
         mode http
         option originalto header X-Client-Dst
 
-  See also : "option httpclose"
+  See also : "option httpclose", "option http-server-close",
+             "option forceclose"
 
 
 option persist
@@ -3685,7 +3938,7 @@ no option transparent
   Note that contrary to a common belief, this option does NOT make HAProxy
   present the client's IP to the server when establishing the connection.
 
-  See also: the "usersrc" argument of the "source" keyword, and the
+  See also: the "usesrc" argument of the "source" keyword, and the
             "transparent" option of the "bind" keyword.
 
 
@@ -4190,7 +4443,7 @@ rspidel <search> [{if | unless} <cond>]  (ignore case)
 
   Any header line matching extended regular expression <search> in the response
   will be completely deleted. Most common use of this is to remove unwanted
-  and/or sensible headers or cookies from a response before passing it to the
+  and/or sensitive headers or cookies from a response before passing it to the
   client.
 
   Header transformations only apply to traffic which passes through HAProxy,
@@ -4290,11 +4543,16 @@ server <name> <address>[:port] [param*]
                                  no    |    no    |   yes  |   yes
   Arguments :
     <name>    is the internal name assigned to this server. This name will
-              appear in logs and alerts.
+              appear in logs and alerts.  If "http-send-server-name" is
+              set, it will be added to the request header sent to the server.
 
     <address> is the IPv4 address of the server. Alternatively, a resolvable
               hostname is supported, but this name will be resolved during
-              start-up.
+              start-up. If no address is specified in front of the port, or if
+              address "0.0.0.0" is specified, then the address used will be the
+              same as the one used by the incoming connection. This makes it
+              possible to relay connections for many IPs on a different port or
+              to perform transparent forwarding with connection limitation.
 
     <ports>   is an optional port specification. If set, all connections will
               be sent to this port. If unset, the same port the client
@@ -4310,7 +4568,8 @@ server <name> <address>[:port] [param*]
         server first  10.1.1.1:1080 cookie first  check inter 1000
         server second 10.1.1.2:1080 cookie second check inter 1000
 
-  See also: "default-server" and section 5 about server options
+  See also: "default-server", "http-send-name-header" and section 5 about
+             server options
 
 
 source <addr>[:<port>] [usesrc { <addr2>[:<port2>] | client | clientip } ]
@@ -4489,6 +4748,59 @@ srvtimeout <timeout> (deprecated)
   See also : "timeout server", "timeout client" and "clitimeout".
 
 
+stats admin { if | unless } <cond>
+  Enable statistics admin level if/unless a condition is matched
+  May be used in sections :   defaults | frontend | listen | backend
+                                 no    |    no    |   yes  |   yes
+
+  This statement enables the statistics admin level if/unless a condition is
+  matched.
+
+  The admin level allows to enable/disable servers from the web interface. By
+  default, statistics page is read-only for security reasons.
+
+  Note : Consider not using this feature in multi-process mode (nbproc > 1)
+         unless you know what you do : memory is not shared between the
+         processes, which can result in random behaviours.
+
+  Currently, the POST request is limited to the buffer size minus the reserved
+  buffer space, which means that if the list of servers is too long, the
+  request won't be processed. It is recommended to alter few servers at a
+  time.
+
+  Example :
+    # statistics admin level only for localhost
+    backend stats_localhost
+        stats enable
+        stats admin if LOCALHOST
+
+  Example :
+    # statistics admin level always enabled because of the authentication
+    backend stats_auth
+        stats enable
+        stats auth  admin:AdMiN123
+        stats admin if TRUE
+
+  Example :
+    # statistics admin level depends on the authenticated user
+    userlist stats-auth
+        group admin    users admin
+        user  admin    insecure-password AdMiN123
+        group readonly users haproxy
+        user  haproxy  insecure-password haproxy
+
+    backend stats_auth
+        stats enable
+        acl AUTH       http_auth(stats-auth)
+        acl AUTH_ADMIN http_auth_group(stats-auth) admin
+        stats http-request auth unless AUTH
+        stats admin if AUTH_ADMIN
+
+  See also : "stats enable", "stats auth", "stats http-request", "nbproc",
+             "bind-process", section 3.4 about userlists and section 7 about
+             ACL usage.
+
+
 stats auth <user>:<passwd>
   Enable statistics with authentication and grant access to an account
   May be used in sections :   defaults | frontend | listen | backend
@@ -4508,7 +4820,7 @@ stats auth <user>:<passwd>
   Since the authentication method is HTTP Basic Authentication, the passwords
   circulate in cleartext on the network. Thus, it was decided that the
   configuration file would also use cleartext passwords to remind the users
-  that those ones should not be sensible and not shared with any other account.
+  that those ones should not be sensitive and not shared with any other account.
 
   It is also possible to reduce the scope of the proxies which appear in the
   report using "stats scope".
@@ -4612,6 +4924,27 @@ stats hide-version
         stats refresh 5s
 
   See also : "stats auth", "stats enable", "stats realm", "stats uri"
+
+
+stats http-request { allow | deny | auth [realm <realm>] }
+             [ { if | unless } <condition> ]
+  Access control for statistics
+
+  May be used in sections:   defaults | frontend | listen | backend
+                                no    |    no    |   yes  |   yes
+
+  As "http-request", these set of options allow to fine control access to
+  statistics. Each option may be followed by if/unless and acl.
+  First option with matched condition (or option without condition) is final.
+  For "deny" a 403 error will be returned, for "allow" normal processing is
+  performed, for "auth" a 401/407 error code is returned so the client
+  should be asked to enter a username and password.
+
+  There is no fixed limit to the number of http-request statements per
+  instance.
+
+  See also : "http-request", section 3.4 about userlists and section 7
+             about ACL usage.
 
 
 stats realm <realm>
@@ -4906,6 +5239,10 @@ stick match <pattern> [table <table>] [{if | unless} <cond>]
   way, it becomes very easy to insert cookies and match on IP addresses in
   order to maintain stickiness between HTTP and HTTPS.
 
+  Note : Consider not using this feature in multi-process mode (nbproc > 1)
+         unless you know what you do : memory is not shared between the
+         processes, which can result in random behaviours.
+
   Example :
     # forward SMTP users to the same server they just used for POP in the
     # last 30 minutes
@@ -4924,8 +5261,8 @@ stick match <pattern> [table <table>] [{if | unless} <cond>]
         server s1 192.168.1.1:25
         server s2 192.168.1.1:25
 
-  See also : "stick-table", "stick on", and section 7 about ACLs and pattern
-             extraction.
+  See also : "stick-table", "stick on", "nbproc", "bind-process" and section 7
+             about ACLs and pattern extraction.
 
 
 stick on <pattern> [table <table>] [{if | unless} <condition>]
@@ -4937,6 +5274,10 @@ stick on <pattern> [table <table>] [{if | unless} <condition>]
          "stick store-request", all with the same arguments. Please refer
          to both keywords for details. It is only provided as a convenience
          for writing more maintainable configurations.
+
+  Note : Consider not using this feature in multi-process mode (nbproc > 1)
+         unless you know what you do : memory is not shared between the
+         processes, which can result in random behaviours.
 
   Examples :
     # The following form ...
@@ -4965,7 +5306,7 @@ stick on <pattern> [table <table>] [{if | unless} <condition>]
         server s1 192.168.1.1:443
         server s2 192.168.1.1:443
 
-  See also : "stick match" and "stick store-request"
+  See also : "stick match", "stick store-request", "nbproc" and "bind-process".
 
 
 stick store-request <pattern> [table <table>] [{if | unless} <condition>]
@@ -5026,6 +5367,10 @@ stick store-request <pattern> [table <table>] [{if | unless} <condition>]
   established, so that the table will contain the real server that processed
   the request.
 
+  Note : Consider not using this feature in multi-process mode (nbproc > 1)
+         unless you know what you do : memory is not shared between the
+         processes, which can result in random behaviours.
+
   Example :
     # forward SMTP users to the same server they just used for POP in the
     # last 30 minutes
@@ -5044,8 +5389,8 @@ stick store-request <pattern> [table <table>] [{if | unless} <condition>]
         server s1 192.168.1.1:25
         server s2 192.168.1.1:25
 
-  See also : "stick-table", "stick on", and section 7 about ACLs and pattern
-             extraction.
+  See also : "stick-table", "stick on", "nbproc", "bind-process" and section 7
+             about ACLs and pattern extraction.
 
 
 stick-table type {ip | integer | string [len <length>] } size <size>
@@ -5214,7 +5559,9 @@ tcp-request inspect-delay <timeout>
   to use large values, for instance to ensure that the client never talks
   before the server (eg: SMTP), or to wait for a client to talk before passing
   data to the server (eg: SSL). Note that the client timeout must cover at
-  least the inspection delay, otherwise it will expire first.
+  least the inspection delay, otherwise it will expire first. If the client
+  closes the connection or if the buffer is full, the delay immediately expires
+  since the contents will not be able to change anymore.
 
   See also : "tcp-request content accept", "tcp-request content reject",
              "timeout client".
@@ -6099,7 +6446,7 @@ always_true
   a temporary replacement for another one when adjusting configurations.
 
 avg_queue <integer>
-avg_queue(frontend) <integer>
+avg_queue(backend) <integer>
   Returns the total number of queued connections of the designated backend
   divided by the number of active servers. This is very similar to "queue"
   except that the size of the farm is considered, in order to give a more
@@ -6113,12 +6460,16 @@ avg_queue(frontend) <integer>
   "be_conn", and "be_sess_rate" criteria.
 
 be_conn <integer>
-be_conn(frontend) <integer>
+be_conn(backend) <integer>
   Applies to the number of currently established connections on the backend,
   possibly including the connection being evaluated. If no backend name is
   specified, the current one is used. But it is also possible to check another
   backend. It can be used to use a specific farm when the nominal one is full.
   See also the "fe_conn", "queue" and "be_sess_rate" criteria.
+
+be_id <integer>
+  Applies to the backend's id. Can be used in frontends to check from which
+  backend it was called.
 
 be_sess_rate <integer>
 be_sess_rate(backend) <integer>
@@ -6219,7 +6570,7 @@ nbsrv(backend) <integer>
   "monitor fail".
 
 queue <integer>
-queue(frontend) <integer>
+queue(backend) <integer>
   Returns the total number of queued connections of the designated backend,
   including all the connections in server queues. If no backend name is
   specified, the current one is used, but it is also possible to check another
@@ -6238,6 +6589,9 @@ src <ip_address>
 
 src_port <integer>
   Applies to the client's TCP source port. This has a very limited usage.
+
+srv_id <integer>
+  Applies to the server's id. Can be used in frontends or backends.
 
 srv_is_up(<server>)
 srv_is_up(<backend>/<server>)
@@ -6394,6 +6748,13 @@ hdr_ip(header) <ip_address>
   X-Client-IP. See "hdr" for more information on header matching. Use the
   shdr_ip() variant for response headers sent by the server.
 
+hdr_len <integer>
+hdr_len(<header>) <integer>
+  Returns true when at least one of the headers has a length which matches the
+  values or ranges specified. This may be used to detect empty or too large
+  headers. See "hdr" for more information on header matching. Use the
+  shdr_len() variant for response headers sent by the server.
+
 hdr_reg <regex>
 hdr_reg(header) <regex>
   Returns true when one of the headers matches of the regular expressions. It
@@ -6424,6 +6785,12 @@ http_auth_group(userlist) <group> [<group>]*
 
   Currently only http basic auth is supported.
 
+http_first_req
+  Returns true when the request being processed is the first one of the
+  connection. This can be used to add or remove headers that may be missing
+  from some requests when a request is not the first one, or even to perform
+  some specific ACL checks only on the first request.
+
 method <string>
   Applies to the method in the HTTP request, eg: "GET". Some predefined ACL
   already check for most common methods.
@@ -6451,6 +6818,10 @@ path_dom <string>
 path_end <string>
   Returns true when the path ends with one of the strings. This may be used to
   control file name extension.
+
+path_len <integer>
+  Returns true when the path length matches the values or ranges specified.
+  This may be used to detect abusive requests for instance.
 
 path_reg <regex>
   Returns true when the path matches one of the regular expressions. It can be
@@ -6498,6 +6869,10 @@ url_ip <ip_address>
   Applies to the IP address specified in the absolute URI in an HTTP request.
   It can be used to prevent access to certain resources such as local network.
   It is useful with option "http_proxy".
+
+url_len <integer>
+  Returns true when the url length matches the values or ranges specified. This
+  may be used to detect abusive requests for instance.
 
 url_port <integer>
   Applies to the port specified in the absolute URI in an HTTP request. It can
@@ -6641,7 +7016,7 @@ The list of currently supported pattern fetch functions is the following :
   dst          This is the destination IPv4 address of the session on the
                client side, which is the address the client connected to.
                It can be useful when running in transparent mode. It is of
-               typie IP and only works with such tables.
+               type IP and only works with such tables.
 
   dst_port     This is the destination TCP port of the session on the client
                side, which is the port the client connected to. This might be
@@ -6704,22 +7079,22 @@ delay.
 8.1. Log levels
 ---------------
 
-TCP and HTTP connections can be logged with informations such as date, time,
+TCP and HTTP connections can be logged with information such as the date, time,
 source IP address, destination address, connection duration, response times,
-HTTP request, the HTTP return code, number of bytes transmitted, the conditions
-in which the session ended, and even exchanged cookies values, to track a
-particular user's problems for example. All messages are sent to up to two
-syslog servers. Check the "log" keyword in section 4.2 for more info about log
-facilities.
+HTTP request, HTTP return code, number of bytes transmitted, conditions
+in which the session ended, and even exchanged cookies values. For example
+track a particular user's problems. All messages may be sent to up to two
+syslog servers. Check the "log" keyword in section 4.2 for more information
+about log facilities.
 
 
 8.2. Log formats
 ----------------
 
 HAProxy supports 4 log formats. Several fields are common between these formats
-and will be detailed in the next sections. A few of them may slightly vary with
-the configuration, due to indicators specific to certain options. The supported
-formats are the following ones :
+and will be detailed in the following sections. A few of them may vary
+slightly with the configuration, due to indicators specific to certain
+options. The supported formats are as follows :
 
   - the default format, which is very basic and very rarely used. It only
     provides very basic information about the incoming connection at the moment
@@ -7445,7 +7820,7 @@ each of which has a special meaning :
 
   - on the second character, the TCP or HTTP session state when it was closed :
 
-        R : th proxy was waiting for a complete, valid REQUEST from the client
+        R : the proxy was waiting for a complete, valid REQUEST from the client
             (HTTP mode only). Nothing was sent to any server.
 
         Q : the proxy was waiting in the QUEUE for a connection slot. This can
@@ -7489,8 +7864,18 @@ each of which has a special meaning :
             this server, or it was not set and the client was redispatched to
             another server.
 
-        V : the client provided a valid cookie, and was sent to the associated
+        V : the client provided a VALID cookie, and was sent to the associated
             server.
+
+        E : the client provided a valid cookie, but with a last date which was
+            older than what is allowed by the "maxidle" cookie parameter, so
+            the cookie is consider EXPIRED and is ignored. The request will be
+            redispatched just as if there was no cookie.
+
+        O : the client provided a valid cookie, but with a first date which was
+            older than what is allowed by the "maxlife" cookie parameter, so
+            the cookie is consider too OLD and is ignored. The request will be
+            redispatched just as if there was no cookie.
 
         - : does not apply (no cookie set in configuration).
 
@@ -7503,6 +7888,12 @@ each of which has a special meaning :
             Note that in "cookie insert" mode, if the server provides a cookie,
             it will still be overwritten and reported as "I" here.
 
+        U : the proxy UPDATED the last date in the cookie that was presented by
+            the client. This can only happen in insert mode with "maxidle". It
+            happens everytime there is activity at a different date than the
+            date indicated in the cookie. If any other change happens, such as
+            a redispatch, then the cookie will be marked as inserted instead.
+
         P : a cookie was PROVIDED by the server and transmitted as-is.
 
         R : the cookie provided by the server was REWRITTEN by the proxy, which
@@ -7512,8 +7903,8 @@ each of which has a special meaning :
 
         - : does not apply (no cookie set in configuration).
 
-The combination of the two first flags give a lot of information about what was
-happening when the session terminated, and why it did terminate. It can be
+The combination of the two first flags gives a lot of information about what
+was happening when the session terminated, and why it did terminate. It can be
 helpful to detect server saturation, network troubles, local system resource
 starvation, attacks, etc...
 
@@ -7628,11 +8019,20 @@ easier finding and understanding.
           so that it does not happen anymore. This status is very rare and
           might happen when the global "ulimit-n" parameter is forced by hand.
 
+     PD   The proxy blocked an incorrectly formatted chunked encoded message in
+          a request or a response, after the server has emitted its headers. In
+          most cases, this will indicate an invalid message from the server to
+          the client.
+
      PH   The proxy blocked the server's response, because it was invalid,
           incomplete, dangerous (cache control), or matched a security filter.
           In any case, an HTTP 502 error is sent to the client. One possible
           cause for this error is an invalid syntax in an HTTP header name
-          containing unauthorized characters.
+          containing unauthorized characters. It is also possible but quite
+          rare, that the proxy blocked a chunked-encoding request from the
+          client due to an invalid syntax, before the server responded. In this
+          case, an HTTP 400 error is sent to the client and reported in the
+          logs.
 
      PR   The proxy blocked the client's HTTP request, either because of an
           invalid HTTP syntax, in which case it returned an HTTP 400 error to
@@ -7648,6 +8048,51 @@ easier finding and understanding.
           preventing the connection to the server from establishing. The error
           logs will tell precisely what was missing. This is very rare and can
           only be solved by proper system tuning.
+
+The combination of the two last flags gives a lot of information about how
+persistence was handled by the client, the server and by haproxy. This is very
+important to troubleshoot disconnections, when users complain they have to
+re-authenticate. The commonly encountered flags are :
+
+     --   Persistence cookie is not enabled.
+
+     NN   No cookie was provided by the client, none was inserted in the
+          response. For instance, this can be in insert mode with "postonly"
+          set on a GET request.
+
+     II   A cookie designating an invalid server was provided by the client,
+          a valid one was inserted in the response. This typically happens when
+          a "server" entry is removed from the configuraton, since its cookie
+          value can be presented by a client when no other server knows it.
+
+     NI   No cookie was provided by the client, one was inserted in the
+          response. This typically happens for first requests from every user
+          in "insert" mode, which makes it an easy way to count real users.
+
+     VN   A cookie was provided by the client, none was inserted in the
+          response. This happens for most responses for which the client has
+          already got a cookie.
+
+     VU   A cookie was provided by the client, with a last visit date which is
+          not completely up-to-date, so an updated cookie was provided in
+          response. This can also happen if there was no date at all, or if
+          there was a date but the "maxidle" parameter was not set, so that the
+          cookie can be switched to unlimited time.
+
+     EI   A cookie was provided by the client, with a last visit date which is
+          too old for the "maxidle" parameter, so the cookie was ignored and a
+          new cookie was inserted in the response.
+
+     OI   A cookie was provided by the client, with a first visit date which is
+          too old for the "maxlife" parameter, so the cookie was ignored and a
+          new cookie was inserted in the response.
+
+     DI   The server designated by the cookie was down, a new server was
+          selected and a new cookie was emitted in the response.
+
+     VI   The server designated by the cookie was not marked dead but could not
+          be reached. A redispatch happened and selected another one, which was
+          then advertised in the response.
 
 
 8.6. Non-printable characters
@@ -7804,7 +8249,7 @@ reading. Their sole purpose is to explain how to decipher them.
 
     => the proxy blocked a server response either because of an "rspdeny" or
        "rspideny" filter, or because the response was improperly formatted and
-       not HTTP-compliant, or because it blocked sensible information which
+       not HTTP-compliant, or because it blocked sensitive information which
        risked being cached. In this case, the response is replaced with a "502
        bad gateway". The flags ("PH--") tell us that it was haproxy who decided
        to return the 502 and not the server.
@@ -7967,7 +8412,7 @@ disable server <backend>/<server>
   "MAINT" status, its tracking servers with the "MAINT(via)" one.
 
   Both the backend and the server may be specified either by their name or by
-  their numeric ID, prefixed with a dash ('#').
+  their numeric ID, prefixed with a sharp ('#').
 
   This command is restricted and can only be issued on sockets configured for
   level "admin".
@@ -7977,7 +8422,7 @@ enable server <backend>/<server>
   server UP and checks are re-enabled.
 
   Both the backend and the server may be specified either by their name or by
-  their numeric ID, prefixed with a dash ('#').
+  their numeric ID, prefixed with a sharp ('#').
 
   This command is restricted and can only be issued on sockets configured for
   level "admin".
@@ -7988,7 +8433,7 @@ get weight <backend>/<server>
   the one that appears in the configuration file. Both are normally equal
   unless the current weight has been changed. Both the backend and the server
   may be specified either by their name or by their numeric ID, prefixed with a
-  dash ('#').
+  sharp ('#').
 
 help
   Print the list of known keywords and their basic usage. The same help screen
@@ -8026,7 +8471,7 @@ set weight <backend>/<server> <weight>[%]
   again after the update by setting it back to 100%. This command is restricted
   and can only be issued on sockets configured for level "admin". Both the
   backend and the server may be specified either by their name or by their
-  numeric ID, prefixed with a dash ('#').
+  numeric ID, prefixed with a sharp ('#').
 
 show errors [<iid>]
   Dump last known request and response errors collected by frontends and

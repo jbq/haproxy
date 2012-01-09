@@ -19,6 +19,8 @@
 #include <syslog.h>
 #include <time.h>
 
+#include <netinet/tcp.h>
+
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -68,20 +70,6 @@ const struct chunk http_100_chunk = {
 	.len = sizeof(HTTP_100)-1
 };
 
-/* This is used by remote monitoring */
-const char HTTP_200[] =
-	"HTTP/1.0 200 OK\r\n"
-	"Cache-Control: no-cache\r\n"
-	"Connection: close\r\n"
-	"Content-Type: text/html\r\n"
-	"\r\n"
-	"<html><body><h1>200 OK</h1>\nHAProxy: service ready.\n</body></html>\n";
-
-const struct chunk http_200_chunk = {
-	.str = (char *)&HTTP_200,
-	.len = sizeof(HTTP_200)-1
-};
-
 /* Warning: no "connection" header is provided with the 3xx messages below */
 const char *HTTP_301 =
 	"HTTP/1.1 301 Moved Permanently\r\n"
@@ -123,6 +111,7 @@ const char *HTTP_407_fmt =
 
 
 const int http_err_codes[HTTP_ERR_SIZE] = {
+	[HTTP_ERR_200] = 200,  /* used by "monitor-uri" */
 	[HTTP_ERR_400] = 400,
 	[HTTP_ERR_403] = 403,
 	[HTTP_ERR_408] = 408,
@@ -133,6 +122,14 @@ const int http_err_codes[HTTP_ERR_SIZE] = {
 };
 
 static const char *http_err_msgs[HTTP_ERR_SIZE] = {
+	[HTTP_ERR_200] =
+	"HTTP/1.0 200 OK\r\n"
+	"Cache-Control: no-cache\r\n"
+	"Connection: close\r\n"
+	"Content-Type: text/html\r\n"
+	"\r\n"
+	"<html><body><h1>200 OK</h1>\nHAProxy: service ready.\n</body></html>\n",
+
 	[HTTP_ERR_400] =
 	"HTTP/1.0 400 Bad request\r\n"
 	"Cache-Control: no-cache\r\n"
@@ -475,8 +472,10 @@ char *find_hdr_value_end(char *s, const char *e)
 	quoted = qdpair = 0;
 	for (; s < e; s++) {
 		if (qdpair)                    qdpair = 0;
-		else if (quoted && *s == '\\') qdpair = 1;
-		else if (quoted && *s == '"')  quoted = 0;
+		else if (quoted) {
+			if (*s == '\\')        qdpair = 1;
+			else if (*s == '"')    quoted = 0;
+		}
 		else if (*s == '"')            quoted = 1;
 		else if (*s == ',')            return s;
 	}
@@ -506,7 +505,7 @@ int http_find_header2(const char *name, int len,
 		 * another one on the same line.
 		 */
 		sol = ctx->line;
-		ctx->del = ctx->val + ctx->vlen;
+		ctx->del = ctx->val + ctx->vlen + ctx->tws;
 		sov = sol + ctx->del;
 		eol = sol + idx->v[cur_idx].len;
 
@@ -554,6 +553,11 @@ int http_find_header2(const char *name, int len,
 			ctx->val  = sov - sol;
 
 			eol = find_hdr_value_end(sov, eol);
+			ctx->tws = 0;
+			while (eol > sov && http_is_lws[(unsigned char)*(eol - 1)]) {
+				eol--;
+				ctx->tws++;
+			}
 			ctx->vlen = eol - sov;
 			return 1;
 		}
@@ -592,33 +596,35 @@ int http_remove_header2(struct http_msg *msg, struct buffer *buf,
 		return 0;
 
 	hdr = &idx->v[cur_idx];
-	if (sol[ctx->del] == ':' && ctx->val + ctx->vlen == hdr->len) {
+	if (sol[ctx->del] == ':' && ctx->val + ctx->vlen + ctx->tws == hdr->len) {
 		/* This was the only value of the header, we must now remove it entirely. */
 		delta = buffer_replace2(buf, sol, sol + hdr->len + hdr->cr + 1, NULL, 0);
 		http_msg_move_end(msg, delta);
 		idx->used--;
 		hdr->len = 0;   /* unused entry */
 		idx->v[ctx->prev].next = idx->v[ctx->idx].next;
+		if (idx->tail == ctx->idx)
+			idx->tail = ctx->prev;
 		ctx->idx = ctx->prev;    /* walk back to the end of previous header */
 		ctx->line -= idx->v[ctx->idx].len + idx->v[cur_idx].cr + 1;
 		ctx->val = idx->v[ctx->idx].len; /* point to end of previous header */
-		ctx->vlen = 0;
+		ctx->tws = ctx->vlen = 0;
 		return ctx->idx;
 	}
 
 	/* This was not the only value of this header. We have to remove between
-	 * ctx->del+1 and ctx->val+ctx->vlen+1 included. If it is the last entry
-	 * of the list, we remove the last separator.
+	 * ctx->del+1 and ctx->val+ctx->vlen+ctx->tws+1 included. If it is the
+	 * last entry of the list, we remove the last separator.
 	 */
 
-	skip_comma = (ctx->val + ctx->vlen == hdr->len) ? 0 : 1;
+	skip_comma = (ctx->val + ctx->vlen + ctx->tws == hdr->len) ? 0 : 1;
 	delta = buffer_replace2(buf, sol + ctx->del + skip_comma,
-				sol + ctx->val + ctx->vlen + skip_comma,
+				sol + ctx->val + ctx->vlen + ctx->tws + skip_comma,
 				NULL, 0);
 	hdr->len += delta;
 	http_msg_move_end(msg, delta);
 	ctx->val = ctx->del;
-	ctx->vlen = 0;
+	ctx->tws = ctx->vlen = 0;
 	return ctx->idx;
 }
 
@@ -835,10 +841,10 @@ void http_return_srv_error(struct session *s, struct stream_interface *si)
 extern const char sess_term_cond[8];
 extern const char sess_fin_state[8];
 extern const char *monthname[12];
-const char sess_cookie[4]     = "NIDV";		/* No cookie, Invalid cookie, cookie for a Down server, Valid cookie */
-const char sess_set_cookie[8] = "N1I3PD5R";	/* No set-cookie, unknown, Set-Cookie Inserted, unknown,
-					    	   Set-cookie seen and left unchanged (passive), Set-cookie Deleted,
-						   unknown, Set-cookie Rewritten */
+const char sess_cookie[8]     = "NIDVEO67";	/* No cookie, Invalid cookie, cookie for a Down server, Valid cookie, Expired cookie, Old cookie, unknown */
+const char sess_set_cookie[8] = "NPDIRU67";	/* No set-cookie, Set-cookie found and left unchanged (passive),
+						   Set-cookie Deleted, Set-Cookie Inserted, Set-cookie Rewritten,
+						   Set-cookie Updated, unknown, unknown */
 struct pool_head *pool2_requri;
 struct pool_head *pool2_capture;
 
@@ -1288,8 +1294,8 @@ const char *http_parse_stsline(struct http_msg *msg, const char *msg_buf,
 			       char **ret_ptr, unsigned int *ret_state)
 {
 	switch (state)	{
-	http_msg_rpver:
 	case HTTP_MSG_RPVER:
+	http_msg_rpver:
 		if (likely(HTTP_IS_VER_TOKEN(*ptr)))
 			EAT_AND_JUMP_OR_RETURN(http_msg_rpver, HTTP_MSG_RPVER);
 
@@ -1300,8 +1306,8 @@ const char *http_parse_stsline(struct http_msg *msg, const char *msg_buf,
 		state = HTTP_MSG_ERROR;
 		break;
 
-	http_msg_rpver_sp:
 	case HTTP_MSG_RPVER_SP:
+	http_msg_rpver_sp:
 		if (likely(!HTTP_IS_LWS(*ptr))) {
 			msg->sl.st.c = (ptr - msg_buf) - msg->som;
 			goto http_msg_rpcode;
@@ -1312,8 +1318,8 @@ const char *http_parse_stsline(struct http_msg *msg, const char *msg_buf,
 		state = HTTP_MSG_ERROR;
 		break;
 
-	http_msg_rpcode:
 	case HTTP_MSG_RPCODE:
+	http_msg_rpcode:
 		if (likely(!HTTP_IS_LWS(*ptr)))
 			EAT_AND_JUMP_OR_RETURN(http_msg_rpcode, HTTP_MSG_RPCODE);
 
@@ -1330,8 +1336,8 @@ const char *http_parse_stsline(struct http_msg *msg, const char *msg_buf,
 		msg->sl.st.r_l = 0;
 		goto http_msg_rpline_eol;
 
-	http_msg_rpcode_sp:
 	case HTTP_MSG_RPCODE_SP:
+	http_msg_rpcode_sp:
 		if (likely(!HTTP_IS_LWS(*ptr))) {
 			msg->sl.st.r = (ptr - msg_buf) - msg->som;
 			goto http_msg_rpreason;
@@ -1341,8 +1347,8 @@ const char *http_parse_stsline(struct http_msg *msg, const char *msg_buf,
 		/* so it's a CR/LF, so there is no reason phrase */
 		goto http_msg_rsp_reason;
 
-	http_msg_rpreason:
 	case HTTP_MSG_RPREASON:
+	http_msg_rpreason:
 		if (likely(!HTTP_IS_CRLF(*ptr)))
 			EAT_AND_JUMP_OR_RETURN(http_msg_rpreason, HTTP_MSG_RPREASON);
 		msg->sl.st.r_l = (ptr - msg_buf) - msg->som - msg->sl.st.r;
@@ -1396,8 +1402,8 @@ const char *http_parse_reqline(struct http_msg *msg, const char *msg_buf,
 			       char **ret_ptr, unsigned int *ret_state)
 {
 	switch (state)	{
-	http_msg_rqmeth:
 	case HTTP_MSG_RQMETH:
+	http_msg_rqmeth:
 		if (likely(HTTP_IS_TOKEN(*ptr)))
 			EAT_AND_JUMP_OR_RETURN(http_msg_rqmeth, HTTP_MSG_RQMETH);
 
@@ -1421,8 +1427,8 @@ const char *http_parse_reqline(struct http_msg *msg, const char *msg_buf,
 		state = HTTP_MSG_ERROR;
 		break;
 
-	http_msg_rqmeth_sp:
 	case HTTP_MSG_RQMETH_SP:
+	http_msg_rqmeth_sp:
 		if (likely(!HTTP_IS_LWS(*ptr))) {
 			msg->sl.rq.u = (ptr - msg_buf) - msg->som;
 			goto http_msg_rquri;
@@ -1432,9 +1438,9 @@ const char *http_parse_reqline(struct http_msg *msg, const char *msg_buf,
 		/* so it's a CR/LF, meaning an HTTP 0.9 request */
 		goto http_msg_req09_uri;
 
-	http_msg_rquri:
 	case HTTP_MSG_RQURI:
-		if (likely(!HTTP_IS_LWS(*ptr)))
+	http_msg_rquri:
+		if (likely((unsigned char)(*ptr - 33) <= 93)) /* 33 to 126 included */
 			EAT_AND_JUMP_OR_RETURN(http_msg_rquri, HTTP_MSG_RQURI);
 
 		if (likely(HTTP_IS_SPHT(*ptr))) {
@@ -1442,11 +1448,24 @@ const char *http_parse_reqline(struct http_msg *msg, const char *msg_buf,
 			EAT_AND_JUMP_OR_RETURN(http_msg_rquri_sp, HTTP_MSG_RQURI_SP);
 		}
 
-		/* so it's a CR/LF, meaning an HTTP 0.9 request */
-		goto http_msg_req09_uri_e;
+		if (likely((unsigned char)*ptr >= 128)) {
+			/* FIXME: we should control whether we want to allow them, but
+			 * until now they were allowed.
+			 */
+			EAT_AND_JUMP_OR_RETURN(http_msg_rquri, HTTP_MSG_RQURI);
+		}
 
-	http_msg_rquri_sp:
+		if (likely(HTTP_IS_CRLF(*ptr))) {
+			/* so it's a CR/LF, meaning an HTTP 0.9 request */
+			goto http_msg_req09_uri_e;
+		}
+
+		/* OK forbidden chars, 0..31 or 127 */
+		state = HTTP_MSG_ERROR;
+		break;
+
 	case HTTP_MSG_RQURI_SP:
+	http_msg_rquri_sp:
 		if (likely(!HTTP_IS_LWS(*ptr))) {
 			msg->sl.rq.v = (ptr - msg_buf) - msg->som;
 			goto http_msg_rqver;
@@ -1456,8 +1475,8 @@ const char *http_parse_reqline(struct http_msg *msg, const char *msg_buf,
 		/* so it's a CR/LF, meaning an HTTP 0.9 request */
 		goto http_msg_req09_ver;
 
-	http_msg_rqver:
 	case HTTP_MSG_RQVER:
+	http_msg_rqver:
 		if (likely(HTTP_IS_VER_TOKEN(*ptr)))
 			EAT_AND_JUMP_OR_RETURN(http_msg_rqver, HTTP_MSG_RQVER);
 
@@ -1603,8 +1622,8 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 	 * We check them first so that request and headers are
 	 * closer to each other (accessed more often).
 	 */
-	http_msg_rpbefore:
 	case HTTP_MSG_RPBEFORE:
+	http_msg_rpbefore:
 		if (likely(HTTP_IS_TOKEN(*ptr))) {
 			/* we have a start of message, but we have to check
 			 * first if we need to remove some CRLF. We can only
@@ -1634,14 +1653,14 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 		EAT_AND_JUMP_OR_RETURN(http_msg_rpbefore_cr, HTTP_MSG_RPBEFORE_CR);
 		/* stop here */
 
-	http_msg_rpbefore_cr:
 	case HTTP_MSG_RPBEFORE_CR:
+	http_msg_rpbefore_cr:
 		EXPECT_LF_HERE(ptr, http_msg_invalid);
 		EAT_AND_JUMP_OR_RETURN(http_msg_rpbefore, HTTP_MSG_RPBEFORE);
 		/* stop here */
 
-	http_msg_rpver:
 	case HTTP_MSG_RPVER:
+	http_msg_rpver:
 	case HTTP_MSG_RPVER_SP:
 	case HTTP_MSG_RPCODE:
 	case HTTP_MSG_RPCODE_SP:
@@ -1662,8 +1681,8 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 			EAT_AND_JUMP_OR_RETURN(http_msg_rpline_end, HTTP_MSG_RPLINE_END);
 		goto http_msg_rpline_end;
 
-	http_msg_rpline_end:
 	case HTTP_MSG_RPLINE_END:
+	http_msg_rpline_end:
 		/* msg->sol must point to the first of CR or LF. */
 		EXPECT_LF_HERE(ptr, http_msg_invalid);
 		EAT_AND_JUMP_OR_RETURN(http_msg_hdr_first, HTTP_MSG_HDR_FIRST);
@@ -1672,8 +1691,8 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 	/*
 	 * Second, states that are specific to the request only
 	 */
-	http_msg_rqbefore:
 	case HTTP_MSG_RQBEFORE:
+	http_msg_rqbefore:
 		if (likely(HTTP_IS_TOKEN(*ptr))) {
 			/* we have a start of message, but we have to check
 			 * first if we need to remove some CRLF. We can only
@@ -1705,14 +1724,14 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 		EAT_AND_JUMP_OR_RETURN(http_msg_rqbefore_cr, HTTP_MSG_RQBEFORE_CR);
 		/* stop here */
 
-	http_msg_rqbefore_cr:
 	case HTTP_MSG_RQBEFORE_CR:
+	http_msg_rqbefore_cr:
 		EXPECT_LF_HERE(ptr, http_msg_invalid);
 		EAT_AND_JUMP_OR_RETURN(http_msg_rqbefore, HTTP_MSG_RQBEFORE);
 		/* stop here */
 
-	http_msg_rqmeth:
 	case HTTP_MSG_RQMETH:
+	http_msg_rqmeth:
 	case HTTP_MSG_RQMETH_SP:
 	case HTTP_MSG_RQURI:
 	case HTTP_MSG_RQURI_SP:
@@ -1733,8 +1752,8 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 			EAT_AND_JUMP_OR_RETURN(http_msg_rqline_end, HTTP_MSG_RQLINE_END);
 		goto http_msg_rqline_end;
 
-	http_msg_rqline_end:
 	case HTTP_MSG_RQLINE_END:
+	http_msg_rqline_end:
 		/* check for HTTP/0.9 request : no version information available.
 		 * msg->sol must point to the first of CR or LF.
 		 */
@@ -1748,8 +1767,8 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 	/*
 	 * Common states below
 	 */
-	http_msg_hdr_first:
 	case HTTP_MSG_HDR_FIRST:
+	http_msg_hdr_first:
 		msg->sol = ptr;
 		if (likely(!HTTP_IS_CRLF(*ptr))) {
 			goto http_msg_hdr_name;
@@ -1759,8 +1778,8 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 			EAT_AND_JUMP_OR_RETURN(http_msg_last_lf, HTTP_MSG_LAST_LF);
 		goto http_msg_last_lf;
 
-	http_msg_hdr_name:
 	case HTTP_MSG_HDR_NAME:
+	http_msg_hdr_name:
 		/* assumes msg->sol points to the first char */
 		if (likely(HTTP_IS_TOKEN(*ptr)))
 			EAT_AND_JUMP_OR_RETURN(http_msg_hdr_name, HTTP_MSG_HDR_NAME);
@@ -1779,8 +1798,8 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 		/* and we still accept this non-token character */
 		EAT_AND_JUMP_OR_RETURN(http_msg_hdr_name, HTTP_MSG_HDR_NAME);
 
-	http_msg_hdr_l1_sp:
 	case HTTP_MSG_HDR_L1_SP:
+	http_msg_hdr_l1_sp:
 		/* assumes msg->sol points to the first char and msg->col to the colon */
 		if (likely(HTTP_IS_SPHT(*ptr)))
 			EAT_AND_JUMP_OR_RETURN(http_msg_hdr_l1_sp, HTTP_MSG_HDR_L1_SP);
@@ -1796,13 +1815,13 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 			EAT_AND_JUMP_OR_RETURN(http_msg_hdr_l1_lf, HTTP_MSG_HDR_L1_LF);
 		goto http_msg_hdr_l1_lf;
 
-	http_msg_hdr_l1_lf:
 	case HTTP_MSG_HDR_L1_LF:
+	http_msg_hdr_l1_lf:
 		EXPECT_LF_HERE(ptr, http_msg_invalid);
 		EAT_AND_JUMP_OR_RETURN(http_msg_hdr_l1_lws, HTTP_MSG_HDR_L1_LWS);
 
-	http_msg_hdr_l1_lws:
 	case HTTP_MSG_HDR_L1_LWS:
+	http_msg_hdr_l1_lws:
 		if (likely(HTTP_IS_SPHT(*ptr))) {
 			/* replace HT,CR,LF with spaces */
 			for (; buf->data+msg->sov < ptr; msg->sov++)
@@ -1813,8 +1832,8 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 		msg->eol = buf->data + msg->sov;
 		goto http_msg_complete_header;
 		
-	http_msg_hdr_val:
 	case HTTP_MSG_HDR_VAL:
+	http_msg_hdr_val:
 		/* assumes msg->sol points to the first char, msg->col to the
 		 * colon, and msg->sov points to the first character of the
 		 * value.
@@ -1831,13 +1850,13 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 			EAT_AND_JUMP_OR_RETURN(http_msg_hdr_l2_lf, HTTP_MSG_HDR_L2_LF);
 		goto http_msg_hdr_l2_lf;
 
-	http_msg_hdr_l2_lf:
 	case HTTP_MSG_HDR_L2_LF:
+	http_msg_hdr_l2_lf:
 		EXPECT_LF_HERE(ptr, http_msg_invalid);
 		EAT_AND_JUMP_OR_RETURN(http_msg_hdr_l2_lws, HTTP_MSG_HDR_L2_LWS);
 
-	http_msg_hdr_l2_lws:
 	case HTTP_MSG_HDR_L2_LWS:
+	http_msg_hdr_l2_lws:
 		if (unlikely(HTTP_IS_SPHT(*ptr))) {
 			/* LWS: replace HT,CR,LF with spaces */
 			for (; msg->eol < ptr; msg->eol++)
@@ -1871,8 +1890,8 @@ void http_msg_analyzer(struct buffer *buf, struct http_msg *msg, struct hdr_idx 
 			EAT_AND_JUMP_OR_RETURN(http_msg_last_lf, HTTP_MSG_LAST_LF);
 		goto http_msg_last_lf;
 
-	http_msg_last_lf:
 	case HTTP_MSG_LAST_LF:
+	http_msg_last_lf:
 		/* Assumes msg->sol points to the first of either CR or LF */
 		EXPECT_LF_HERE(ptr, http_msg_invalid);
 		ptr++;
@@ -2079,13 +2098,13 @@ int http_parse_chunk_size(struct buffer *buf, struct http_msg *msg)
 		if (++ptr >= end)
 			ptr = buf->data;
 		if (chunk & 0xF000000) /* overflow will occur */
-			return -1;
+			goto error;
 		chunk = (chunk << 4) + c;
 	}
 
 	/* empty size not allowed */
 	if (ptr == buf->lr)
-		return -1;
+		goto error;
 
 	while (http_is_spht[(unsigned char)*ptr]) {
 		if (++ptr >= end)
@@ -2108,7 +2127,7 @@ int http_parse_chunk_size(struct buffer *buf, struct http_msg *msg)
 			}
 
 			if (*ptr != '\n')
-				return -1;
+				goto error;
 			if (++ptr >= end)
 				ptr = buf->data;
 			/* done */
@@ -2131,7 +2150,7 @@ int http_parse_chunk_size(struct buffer *buf, struct http_msg *msg)
 			continue;
 		}
 		else
-			return -1;
+			goto error;
 	}
 
 	/* OK we found our CRLF and now <ptr> points to the next byte,
@@ -2140,9 +2159,13 @@ int http_parse_chunk_size(struct buffer *buf, struct http_msg *msg)
 	 */
 	msg->sov += ptr - buf->lr;
 	buf->lr = ptr;
-	msg->hdr_content_len = chunk;
+	msg->chunk_len = chunk;
+	msg->body_len += chunk;
 	msg->msg_state = chunk ? HTTP_MSG_DATA : HTTP_MSG_TRAILERS;
 	return 1;
+ error:
+	msg->err_pos = ptr - buf->data;
+	return -1;
 }
 
 /* This function skips trailers in the buffer <buf> associated with HTTP
@@ -2181,8 +2204,10 @@ int http_forward_trailers(struct buffer *buf, struct http_msg *msg)
 			}
 
 			if (*ptr == '\r') {
-				if (p1)
+				if (p1) {
+					msg->err_pos = ptr - buf->data;
 					return -1;
+				}
 				p1 = ptr;
 			}
 
@@ -2249,8 +2274,10 @@ int http_skip_chunk_crlf(struct buffer *buf, struct http_msg *msg)
 	if (bytes > buf->l - buf->send_max)
 		return 0;
 
-	if (*ptr != '\n')
+	if (*ptr != '\n') {
+		msg->err_pos = ptr - buf->data;
 		return -1;
+	}
 
 	ptr++;
 	if (ptr >= buf->data + buf->size)
@@ -2460,6 +2487,8 @@ int http_wait_for_request(struct session *s, struct buffer *req, int an_bit)
 			 * 414 Request URI too long instead.
 			 */
 			proxy_inc_fe_req_ctr(s->fe);
+			if (msg->err_pos < 0)
+				msg->err_pos = req->l;
 			goto return_bad_req;
 		}
 
@@ -2473,7 +2502,8 @@ int http_wait_for_request(struct session *s, struct buffer *req, int an_bit)
 
 			/* we cannot return any message on error */
 			if (msg->err_pos >= 0)
-				http_capture_bad_message(&s->fe->invalid_req, s, req, msg, s->fe);
+				http_capture_bad_message(&s->fe->invalid_req, s, req, msg, msg->msg_state, s->fe);
+
 			msg->msg_state = HTTP_MSG_ERROR;
 			req->analysers = 0;
 
@@ -2497,7 +2527,7 @@ int http_wait_for_request(struct session *s, struct buffer *req, int an_bit)
 
 			/* read timeout : give up with an error message. */
 			if (msg->err_pos >= 0)
-				http_capture_bad_message(&s->fe->invalid_req, s, req, msg, s->fe);
+				http_capture_bad_message(&s->fe->invalid_req, s, req, msg, msg->msg_state, s->fe);
 			txn->status = 408;
 			stream_int_retnclose(req->prod, error_message(s, HTTP_ERR_408));
 			msg->msg_state = HTTP_MSG_ERROR;
@@ -2522,7 +2552,7 @@ int http_wait_for_request(struct session *s, struct buffer *req, int an_bit)
 				goto failed_keep_alive;
 
 			if (msg->err_pos >= 0)
-				http_capture_bad_message(&s->fe->invalid_req, s, req, msg, s->fe);
+				http_capture_bad_message(&s->fe->invalid_req, s, req, msg, msg->msg_state, s->fe);
 			txn->status = 400;
 			stream_int_retnclose(req->prod, error_message(s, HTTP_ERR_400));
 			msg->msg_state = HTTP_MSG_ERROR;
@@ -2541,6 +2571,15 @@ int http_wait_for_request(struct session *s, struct buffer *req, int an_bit)
 		buffer_dont_connect(req);
 		req->flags |= BF_READ_DONTWAIT; /* try to get back here ASAP */
 		s->rep->flags &= ~BF_EXPECT_MORE; /* speed up sending a previous response */
+#ifdef TCP_QUICKACK
+		if (s->listener->options & LI_O_NOQUICKACK) {
+			/* We need more data, we have to re-enable quick-ack in case we
+			 * previously disabled it, otherwise we might cause the client
+			 * to delay next data.
+			 */
+			setsockopt(s->si[0].fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+		}
+#endif
 
 		if ((msg->msg_state != HTTP_MSG_RQBEFORE) && (txn->flags & TX_WAIT_NEXT_RQ)) {
 			/* If the client starts to talk, let's fall back to
@@ -2601,7 +2640,7 @@ int http_wait_for_request(struct session *s, struct buffer *req, int an_bit)
 	 * to block on that, so we have to capture it now.
 	 */
 	if (unlikely(msg->err_pos >= 0))
-		http_capture_bad_message(&s->fe->invalid_req, s, req, msg, s->fe);
+		http_capture_bad_message(&s->fe->invalid_req, s, req, msg, msg->msg_state, s->fe);
 
 	/*
 	 * 1: identify the method
@@ -2647,7 +2686,7 @@ int http_wait_for_request(struct session *s, struct buffer *req, int an_bit)
 
 		/* nothing to fail, let's reply normaly */
 		txn->status = 200;
-		stream_int_retnclose(req->prod, &http_200_chunk);
+		stream_int_retnclose(req->prod, error_message(s, HTTP_ERR_200));
 		goto return_prx_cond;
 	}
 
@@ -2766,20 +2805,28 @@ int http_wait_for_request(struct session *s, struct buffer *req, int an_bit)
 	       http_find_header2("Content-Length", 14, msg->sol, &txn->hdr_idx, &ctx)) {
 		signed long long cl;
 
-		if (!ctx.vlen)
+		if (!ctx.vlen) {
+			msg->err_pos = ctx.line + ctx.val - req->data;
 			goto return_bad_req;
+		}
 
-		if (strl2llrc(ctx.line + ctx.val, ctx.vlen, &cl))
+		if (strl2llrc(ctx.line + ctx.val, ctx.vlen, &cl)) {
+			msg->err_pos = ctx.line + ctx.val - req->data;
 			goto return_bad_req; /* parse failure */
+		}
 
-		if (cl < 0)
+		if (cl < 0) {
+			msg->err_pos = ctx.line + ctx.val - req->data;
 			goto return_bad_req;
+		}
 
-		if ((txn->flags & TX_REQ_CNT_LEN) && (msg->hdr_content_len != cl))
+		if ((txn->flags & TX_REQ_CNT_LEN) && (msg->chunk_len != cl)) {
+			msg->err_pos = ctx.line + ctx.val - req->data;
 			goto return_bad_req; /* already specified, was different */
+		}
 
 		txn->flags |= TX_REQ_CNT_LEN | TX_REQ_XFER_LEN;
-		msg->hdr_content_len = cl;
+		msg->body_len = msg->chunk_len = cl;
 	}
 
 	/* bodyless requests have a known length */
@@ -2797,7 +2844,7 @@ int http_wait_for_request(struct session *s, struct buffer *req, int an_bit)
 		/* we detected a parsing error. We want to archive this request
 		 * in the dedicated proxy area for later troubleshooting.
 		 */
-		http_capture_bad_message(&s->fe->invalid_req, s, req, msg, s->fe);
+		http_capture_bad_message(&s->fe->invalid_req, s, req, msg, msg->msg_state, s->fe);
 	}
 
 	txn->req.msg_state = HTTP_MSG_ERROR;
@@ -2819,6 +2866,113 @@ int http_wait_for_request(struct session *s, struct buffer *req, int an_bit)
 	return 0;
 }
 
+/* We reached the stats page through a POST request.
+ * Parse the posted data and enable/disable servers if necessary.
+ * Returns 1 if request was parsed or zero if it needs more data.
+ */
+int http_process_req_stat_post(struct session *s, struct buffer *req)
+{
+	struct http_txn *txn = &s->txn;
+	struct proxy *px;
+	struct server *sv;
+
+	char *backend = NULL;
+	int action = 0;
+
+	char *first_param, *cur_param, *next_param, *end_params;
+
+	first_param = req->data + txn->req.eoh + 2;
+	end_params  = first_param + txn->req.body_len;
+
+	cur_param = next_param = end_params;
+
+	if (end_params >= req->data + req->size - global.tune.maxrewrite) {
+		/* Prevent buffer overflow */
+		s->data_ctx.stats.st_code = STAT_STATUS_EXCD;
+		return 1;
+	}
+	else if (end_params > req->data + req->l) {
+		/* we need more data */
+		s->data_ctx.stats.st_code = STAT_STATUS_NONE;
+		return 0;
+	}
+
+	*end_params = '\0';
+
+	s->data_ctx.stats.st_code = STAT_STATUS_NONE;
+
+	/*
+	 * Parse the parameters in reverse order to only store the last value.
+	 * From the html form, the backend and the action are at the end.
+	 */
+	while (cur_param > first_param) {
+		char *key, *value;
+
+		cur_param--;
+		if ((*cur_param == '&') || (cur_param == first_param)) {
+			/* Parse the key */
+			key = cur_param;
+			if (cur_param != first_param) {
+				/* delimit the string for the next loop */
+				*key++ = '\0';
+			}
+
+			/* Parse the value */
+			value = key;
+			while (*value != '\0' && *value != '=') {
+				value++;
+			}
+			if (*value == '=') {
+				/* Ok, a value is found, we can mark the end of the key */
+				*value++ = '\0';
+			}
+
+			if (!url_decode(key) || !url_decode(value))
+				break;
+
+			/* Now we can check the key to see what to do */
+			if (!backend && strcmp(key, "b") == 0) {
+				backend = value;
+			}
+			else if (!action && strcmp(key, "action") == 0) {
+				if (strcmp(value, "disable") == 0) {
+					action = 1;
+				}
+				else if (strcmp(value, "enable") == 0) {
+					action = 2;
+				} else {
+					/* unknown action, no need to continue */
+					break;
+				}
+			}
+			else if (strcmp(key, "s") == 0) {
+				if (backend && action && get_backend_server(backend, value, &px, &sv)) {
+					switch (action) {
+					case 1:
+						if ((px->state != PR_STSTOPPED) && !(sv->state & SRV_MAINTAIN)) {
+							/* Not already in maintenance, we can change the server state */
+							sv->state |= SRV_MAINTAIN;
+							set_server_down(sv);
+							s->data_ctx.stats.st_code = STAT_STATUS_DONE;
+						}
+						break;
+					case 2:
+						if ((px->state != PR_STSTOPPED) && (sv->state & SRV_MAINTAIN)) {
+							/* Already in maintenance, we can change the server state */
+							set_server_up(sv);
+							sv->health = sv->rise;	/* up, but will fall down at first failure */
+							s->data_ctx.stats.st_code = STAT_STATUS_DONE;
+						}
+						break;
+					}
+				}
+			}
+			next_param = cur_param;
+		}
+	}
+	return 1;
+}
+
 /* This stream analyser runs all HTTP request processing which is common to
  * frontends and backends, which means blocking ACLs, filters, connection-close,
  * reqadd, stats and redirects. This is performed for the designated proxy.
@@ -2834,7 +2988,7 @@ int http_process_req_common(struct session *s, struct buffer *req, int an_bit, s
 	struct req_acl_rule *req_acl, *req_acl_final = NULL;
 	struct redirect_rule *rule;
 	struct cond_wordlist *wl;
-	int del_ka, del_cl, do_stats;
+	int do_stats;
 
 	if (unlikely(msg->msg_state < HTTP_MSG_BODY)) {
 		/* we need more data */
@@ -2947,15 +3101,14 @@ int http_process_req_common(struct session *s, struct buffer *req, int an_bit, s
 	 * are there for the first time.
 	 */
 
-	del_cl = del_ka = 0;
-
 	if ((!(txn->flags & TX_HDR_CONN_PRS) &&
 	     (s->fe->options & (PR_O_KEEPALIVE|PR_O_SERVER_CLO|PR_O_HTTP_CLOSE|PR_O_FORCE_CLO))) ||
 	    ((s->fe->options & (PR_O_KEEPALIVE|PR_O_SERVER_CLO|PR_O_HTTP_CLOSE|PR_O_FORCE_CLO)) !=
 	     (s->be->options & (PR_O_KEEPALIVE|PR_O_SERVER_CLO|PR_O_HTTP_CLOSE|PR_O_FORCE_CLO)))) {
 		int tmp = TX_CON_WANT_TUN;
 
-		if ((s->fe->options|s->be->options) & PR_O_KEEPALIVE)
+		if ((s->fe->options|s->be->options) & PR_O_KEEPALIVE ||
+		    ((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA))
 			tmp = TX_CON_WANT_KAL;
 		if ((s->fe->options|s->be->options) & PR_O_SERVER_CLO)
 			tmp = TX_CON_WANT_SCL;
@@ -2982,7 +3135,7 @@ int http_process_req_common(struct session *s, struct buffer *req, int an_bit, s
 		     (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL) &&
 		    ((txn->flags & TX_HDR_CONN_CLO) ||                         /* "connection: close" */
 		     (txn->flags & (TX_REQ_VER_11|TX_HDR_CONN_KAL)) == 0 ||    /* no "connection: k-a" in 1.0 */
-		     ((s->fe->options|s->be->options) & PR_O_HTTP_CLOSE) ||    /* httpclose + any = forceclose */
+		     ((s->fe->options|s->be->options) & PR_O_HTTP_CLOSE) ||    /* httpclose+any = forceclose */
 		     !(txn->flags & TX_REQ_XFER_LEN) ||                        /* no length known => close */
 		     s->fe->state == PR_STSTOPPED))                            /* frontend is stopping */
 		    txn->flags = (txn->flags & ~TX_CON_WANT_MSK) | TX_CON_WANT_CLO;
@@ -3005,7 +3158,7 @@ int http_process_req_common(struct session *s, struct buffer *req, int an_bit, s
 
 	if (req_acl_final && req_acl_final->action == PR_REQ_ACL_ACT_HTTP_AUTH) {
 		struct chunk msg;
-		char *realm = req_acl->http_auth.realm;
+		char *realm = req_acl_final->http_auth.realm;
 
 		if (!realm)
 			realm = do_stats?STATS_DEFAULT_REALM:px->id;
@@ -3018,10 +3171,60 @@ int http_process_req_common(struct session *s, struct buffer *req, int an_bit, s
 	}
 
 	if (do_stats) {
-		/* We need to provied stats for this request.
+		struct stats_admin_rule *stats_admin_rule;
+
+		/* We need to provide stats for this request.
 		 * FIXME!!! that one is rather dangerous, we want to
 		 * make it follow standard rules (eg: clear req->analysers).
 		 */
+
+		/* now check whether we have some admin rules for this request */
+		list_for_each_entry(stats_admin_rule, &s->be->uri_auth->admin_rules, list) {
+			int ret = 1;
+
+			if (stats_admin_rule->cond) {
+				ret = acl_exec_cond(stats_admin_rule->cond, s->be, s, &s->txn, ACL_DIR_REQ);
+				ret = acl_pass(ret);
+				if (stats_admin_rule->cond->pol == ACL_COND_UNLESS)
+					ret = !ret;
+			}
+
+			if (ret) {
+				/* no rule, or the rule matches */
+				s->data_ctx.stats.flags |= STAT_ADMIN;
+				break;
+			}
+		}
+
+		/* Was the status page requested with a POST ? */
+		if (txn->meth == HTTP_METH_POST) {
+			if (s->data_ctx.stats.flags & STAT_ADMIN) {
+				if (msg->msg_state < HTTP_MSG_100_SENT) {
+					/* If we have HTTP/1.1 and Expect: 100-continue, then we must
+					 * send an HTTP/1.1 100 Continue intermediate response.
+					 */
+					if (txn->flags & TX_REQ_VER_11) {
+						struct hdr_ctx ctx;
+						ctx.idx = 0;
+						/* Expect is allowed in 1.1, look for it */
+						if (http_find_header2("Expect", 6, msg->sol, &txn->hdr_idx, &ctx) &&
+						    unlikely(ctx.vlen == 12 && strncasecmp(ctx.line+ctx.val, "100-continue", 12) == 0)) {
+							buffer_write(s->rep, http_100_chunk.str, http_100_chunk.len);
+						}
+					}
+					msg->msg_state = HTTP_MSG_100_SENT;
+					s->logs.tv_request = now;  /* update the request timer to reflect full request */
+				}
+				if (!http_process_req_stat_post(s, req)) {
+					/* we need more data */
+					req->analysers |= an_bit;
+					buffer_dont_connect(req);
+					return 0;
+				}
+			} else {
+				s->data_ctx.stats.st_code = STAT_STATUS_DENY;
+			}
+		}
 
 		s->logs.tv_request = now;
 		s->data_source = DATA_SRC_STATS;
@@ -3150,7 +3353,7 @@ int http_process_req_common(struct session *s, struct buffer *req, int an_bit, s
 
 			if (rule->rdr_len >= 1 && *rule->rdr_str == '/' &&
 			    (txn->flags & TX_REQ_XFER_LEN) &&
-			    !(txn->flags & TX_REQ_TE_CHNK) && !txn->req.hdr_content_len &&
+			    !(txn->flags & TX_REQ_TE_CHNK) && !txn->req.body_len &&
 			    ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_SCL ||
 			     (txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL)) {
 				/* keep-alive possible */
@@ -3207,7 +3410,7 @@ int http_process_req_common(struct session *s, struct buffer *req, int an_bit, s
 		/* we detected a parsing error. We want to archive this request
 		 * in the dedicated proxy area for later troubleshooting.
 		 */
-		http_capture_bad_message(&s->fe->invalid_req, s, req, msg, s->fe);
+		http_capture_bad_message(&s->fe->invalid_req, s, req, msg, msg->msg_state, s->fe);
 	}
 
 	txn->req.msg_state = HTTP_MSG_ERROR;
@@ -3294,7 +3497,15 @@ int http_process_request(struct session *s, struct buffer *req, int an_bit)
 	 * asks for it.
 	 */
 	if ((s->fe->options | s->be->options) & PR_O_FWDFOR) {
-		if (s->cli_addr.ss_family == AF_INET) {
+		struct hdr_ctx ctx = { .idx = 0 };
+
+		if (!((s->fe->options2 | s->be->options2) & PR_O2_FF_ALWAYS) &&
+		    http_find_header2(s->be->fwdfor_hdr_name, s->be->fwdfor_hdr_len, txn->req.sol, &txn->hdr_idx, &ctx)) {
+			/* The header is set to be added only if none is present
+			 * and we found it, so don't do anything.
+			 */
+		}
+		else if (s->cli_addr.ss_family == AF_INET) {
 			/* Add an X-Forwarded-For header unless the source IP is
 			 * in the 'except' network range.
 			 */
@@ -3408,14 +3619,14 @@ int http_process_request(struct session *s, struct buffer *req, int an_bit)
 		unsigned int want_flags = 0;
 
 		if (txn->flags & TX_REQ_VER_11) {
-			if (((txn->flags & TX_CON_WANT_MSK) >= TX_CON_WANT_SCL &&
-			     !((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA)) ||
-			    ((s->fe->options|s->be->options) & PR_O_HTTP_CLOSE))
+			if (((txn->flags & TX_CON_WANT_MSK) >= TX_CON_WANT_SCL ||
+			    ((s->fe->options|s->be->options) & PR_O_HTTP_CLOSE)) &&
+			    !((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA))
 				want_flags |= TX_CON_CLO_SET;
 		} else {
-			if ((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL ||
-			    (((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA) &&
-			     !((s->fe->options|s->be->options) & PR_O_HTTP_CLOSE)))
+			if (((txn->flags & TX_CON_WANT_MSK) == TX_CON_WANT_KAL &&
+			     !((s->fe->options|s->be->options) & PR_O_HTTP_CLOSE)) ||
+			    ((s->fe->options2|s->be->options2) & PR_O2_FAKE_KA))
 				want_flags |= TX_CON_KAL_SET;
 		}
 
@@ -3431,14 +3642,25 @@ int http_process_request(struct session *s, struct buffer *req, int an_bit)
 	if (!(s->flags & (SN_ASSIGNED|SN_DIRECT)) &&
 	    s->txn.meth == HTTP_METH_POST && s->be->url_param_name != NULL &&
 	    s->be->url_param_post_limit != 0 &&
-	    (txn->flags & (TX_REQ_CNT_LEN|TX_REQ_TE_CHNK)) &&
-	    memchr(msg->sol + msg->sl.rq.u, '?', msg->sl.rq.u_l) == NULL) {
+	    (txn->flags & (TX_REQ_CNT_LEN|TX_REQ_TE_CHNK))) {
 		buffer_dont_connect(req);
 		req->analysers |= AN_REQ_HTTP_BODY;
 	}
 
-	if (txn->flags & TX_REQ_XFER_LEN)
+	if (txn->flags & TX_REQ_XFER_LEN) {
 		req->analysers |= AN_REQ_HTTP_XFER_BODY;
+#ifdef TCP_QUICKACK
+		/* We expect some data from the client. Unless we know for sure
+		 * we already have a full request, we have to re-enable quick-ack
+		 * in case we previously disabled it, otherwise we might cause
+		 * the client to delay further data.
+		 */
+		if ((s->listener->options & LI_O_NOQUICKACK) &&
+		    ((txn->flags & TX_REQ_TE_CHNK) ||
+		     (msg->body_len > req->l - txn->req.eoh - 2)))
+			setsockopt(s->si[0].fd, IPPROTO_TCP, TCP_QUICKACK, &one, sizeof(one));
+#endif
+	}
 
 	/*************************************************************
 	 * OK, that's finished for the headers. We have done what we *
@@ -3456,7 +3678,7 @@ int http_process_request(struct session *s, struct buffer *req, int an_bit)
 		/* we detected a parsing error. We want to archive this request
 		 * in the dedicated proxy area for later troubleshooting.
 		 */
-		http_capture_bad_message(&s->fe->invalid_req, s, req, msg, s->fe);
+		http_capture_bad_message(&s->fe->invalid_req, s, req, msg, msg->msg_state, s->fe);
 	}
 
 	txn->req.msg_state = HTTP_MSG_ERROR;
@@ -3570,7 +3792,7 @@ int http_process_request_body(struct session *s, struct buffer *req, int an_bit)
 	}
 
 	if (msg->msg_state == HTTP_MSG_CHUNK_SIZE) {
-		/* read the chunk size and assign it to ->hdr_content_len, then
+		/* read the chunk size and assign it to ->chunk_len, then
 		 * set ->sov and ->lr to point to the body and switch to DATA or
 		 * TRAILERS state.
 		 */
@@ -3589,8 +3811,8 @@ int http_process_request_body(struct session *s, struct buffer *req, int an_bit)
 	 * We're waiting for at least <url_param_post_limit> bytes after msg->sov.
 	 */
 
-	if (msg->hdr_content_len < limit)
-		limit = msg->hdr_content_len;
+	if (msg->body_len < limit)
+		limit = msg->body_len;
 
 	if (req->l - (msg->sov - msg->som) >= limit)    /* we have enough bytes now */
 		goto http_end;
@@ -3647,6 +3869,34 @@ int http_process_request_body(struct session *s, struct buffer *req, int an_bit)
 	s->fe->counters.failed_req++;
 	if (s->listener->counters)
 		s->listener->counters->failed_req++;
+	return 0;
+}
+
+int http_send_name_header(struct http_txn *txn, struct http_msg *msg, struct buffer *buf, struct proxy* be, const char* srv_name) {
+
+	struct hdr_ctx ctx;
+
+	ctx.idx = 0;
+
+	char *hdr_name = be->server_id_hdr_name;
+	int hdr_name_len = be->server_id_hdr_len;
+
+	char *hdr_val;
+
+	while (http_find_header2(hdr_name, hdr_name_len, msg->sol, &txn->hdr_idx, &ctx)) {
+		/* remove any existing values from the header */
+	        http_remove_header2(msg, buf, &txn->hdr_idx, &ctx);
+	}
+
+	/* Add the new header requested with the server value */
+	hdr_val = trash;
+	memcpy(hdr_val, hdr_name, hdr_name_len);
+	hdr_val += hdr_name_len;
+	*hdr_val++ = ':';
+	*hdr_val++ = ' ';
+	hdr_val += strlcpy2(hdr_val, srv_name, trash + sizeof(trash) - hdr_val);
+	http_header_add_tail2(buf, msg, &txn->hdr_idx, trash, hdr_val - trash);
+
 	return 0;
 }
 
@@ -3735,8 +3985,8 @@ void http_end_txn_clean_session(struct session *s)
 	s->req->cons->err_loc   = NULL;
 	s->req->cons->exp       = TICK_ETERNITY;
 	s->req->cons->flags     = SI_FL_NONE;
-	s->req->flags &= ~(BF_SHUTW|BF_SHUTW_NOW|BF_AUTO_CONNECT|BF_WRITE_ERROR|BF_STREAMER|BF_STREAMER_FAST);
-	s->rep->flags &= ~(BF_SHUTR|BF_SHUTR_NOW|BF_READ_ATTACHED|BF_READ_ERROR|BF_READ_NOEXP|BF_STREAMER|BF_STREAMER_FAST|BF_WRITE_PARTIAL);
+	s->req->flags &= ~(BF_SHUTW|BF_SHUTW_NOW|BF_AUTO_CONNECT|BF_WRITE_ERROR|BF_STREAMER|BF_STREAMER_FAST|BF_NEVER_WAIT);
+	s->rep->flags &= ~(BF_SHUTR|BF_SHUTR_NOW|BF_READ_ATTACHED|BF_READ_ERROR|BF_READ_NOEXP|BF_STREAMER|BF_STREAMER_FAST|BF_WRITE_PARTIAL|BF_NEVER_WAIT);
 	s->flags &= ~(SN_DIRECT|SN_ASSIGNED|SN_ADDR_SET|SN_BE_ASSIGNED|SN_FORCE_PRST|SN_IGNORE_PRST);
 	s->flags &= ~(SN_CURR_SESS|SN_REDIRECTABLE);
 	s->txn.meth = 0;
@@ -3744,6 +3994,11 @@ void http_end_txn_clean_session(struct session *s)
 	s->txn.flags |= TX_NOT_FIRST | TX_WAIT_NEXT_RQ;
 	if (s->be->options2 & PR_O2_INDEPSTR)
 		s->req->cons->flags |= SI_FL_INDEP_STR;
+
+	if (s->fe->options2 & PR_O2_NODELAY) {
+		s->req->flags |= BF_NEVER_WAIT;
+		s->rep->flags |= BF_NEVER_WAIT;
+	}
 
 	/* if the request buffer is not empty, it means we're
 	 * about to process another request, so send pending
@@ -3800,9 +4055,14 @@ int http_sync_req_state(struct session *s)
 
 	if (txn->req.msg_state == HTTP_MSG_DONE) {
 		/* No need to read anymore, the request was completely parsed.
-		 * We can shut the read side unless we want to abort_on_close.
+		 * We can shut the read side unless we want to abort_on_close,
+		 * or we have a POST request. The issue with POST requests is
+		 * that some browsers still send a CRLF after the request, and
+		 * this CRLF must be read so that it does not remain in the kernel
+		 * buffers, otherwise a close could cause an RST on some systems
+		 * (eg: Linux).
 		 */
-		if (buf->cons->state == SI_ST_EST || !(s->be->options & PR_O_ABRT_CLOSE))
+		if (!(s->be->options & PR_O_ABRT_CLOSE) && txn->meth != HTTP_METH_POST)
 			buffer_dont_read(buf);
 
 		if (txn->rsp.msg_state == HTTP_MSG_ERROR)
@@ -4100,7 +4360,7 @@ int http_resync_states(struct session *s)
  * remaining data and to resync after end of body. It expects the msg_state to
  * be between MSG_BODY and MSG_DONE (inclusive). It returns zero if it needs to
  * read more data, or 1 once we can go on with next request or end the session.
- * When in MSG_DATA or MSG_TRAILERS, it will automatically forward hdr_content_len
+ * When in MSG_DATA or MSG_TRAILERS, it will automatically forward chunk_len
  * bytes of pending data + the headers if not already done (between som and sov).
  * It eventually adjusts som to match sov after the data in between have been sent.
  */
@@ -4145,15 +4405,17 @@ int http_request_forward_body(struct session *s, struct buffer *req, int an_bit)
 	}
 
 	while (1) {
+		int bytes;
+
 		http_silent_debug(__LINE__, s);
 		/* we may have some data pending */
-		if (msg->hdr_content_len || msg->som != msg->sov) {
-			int bytes = msg->sov - msg->som;
-			if (bytes < 0) /* sov may have wrapped at the end */
-				bytes += req->size;
-			buffer_forward(req, bytes + msg->hdr_content_len);
-			msg->hdr_content_len = 0; /* don't forward that again */
+		bytes = msg->sov - msg->som;
+		if (msg->chunk_len || bytes) {
 			msg->som = msg->sov;
+			if (likely(bytes < 0)) /* sov may have wrapped at the end */
+				bytes += req->size;
+			msg->chunk_len += (unsigned int)bytes;
+			msg->chunk_len -= buffer_forward(req, msg->chunk_len);
 		}
 
 		if (msg->msg_state == HTTP_MSG_DATA) {
@@ -4168,7 +4430,7 @@ int http_request_forward_body(struct session *s, struct buffer *req, int an_bit)
 				msg->msg_state = HTTP_MSG_DONE;
 		}
 		else if (msg->msg_state == HTTP_MSG_CHUNK_SIZE) {
-			/* read the chunk size and assign it to ->hdr_content_len, then
+			/* read the chunk size and assign it to ->chunk_len, then
 			 * set ->sov and ->lr to point to the body and switch to DATA or
 			 * TRAILERS state.
 			 */
@@ -4176,8 +4438,11 @@ int http_request_forward_body(struct session *s, struct buffer *req, int an_bit)
 
 			if (!ret)
 				goto missing_data;
-			else if (ret < 0)
+			else if (ret < 0) {
+				if (msg->err_pos >= 0)
+					http_capture_bad_message(&s->fe->invalid_req, s, req, msg, HTTP_MSG_CHUNK_SIZE, s->be);
 				goto return_bad_req;
+			}
 			/* otherwise we're in HTTP_MSG_DATA or HTTP_MSG_TRAILERS state */
 		}
 		else if (msg->msg_state == HTTP_MSG_DATA_CRLF) {
@@ -4192,8 +4457,11 @@ int http_request_forward_body(struct session *s, struct buffer *req, int an_bit)
 
 			if (ret == 0)
 				goto missing_data;
-			else if (ret < 0)
+			else if (ret < 0) {
+				if (msg->err_pos >= 0)
+					http_capture_bad_message(&s->fe->invalid_req, s, req, msg, HTTP_MSG_DATA_CRLF, s->be);
 				goto return_bad_req;
+			}
 			/* we're in MSG_CHUNK_SIZE now */
 		}
 		else if (msg->msg_state == HTTP_MSG_TRAILERS) {
@@ -4201,20 +4469,54 @@ int http_request_forward_body(struct session *s, struct buffer *req, int an_bit)
 
 			if (ret == 0)
 				goto missing_data;
-			else if (ret < 0)
+			else if (ret < 0) {
+				if (msg->err_pos >= 0)
+					http_capture_bad_message(&s->fe->invalid_req, s, req, msg, HTTP_MSG_TRAILERS, s->be);
 				goto return_bad_req;
+			}
 			/* we're in HTTP_MSG_DONE now */
 		}
 		else {
+			int old_state = msg->msg_state;
+
 			/* other states, DONE...TUNNEL */
 			if (http_resync_states(s)) {
 				/* some state changes occurred, maybe the analyser
 				 * was disabled too.
 				 */
-				if (unlikely(msg->msg_state == HTTP_MSG_ERROR))
+				if (unlikely(msg->msg_state == HTTP_MSG_ERROR)) {
+					if (req->flags & BF_SHUTW) {
+						/* request errors are most likely due to
+						 * the server aborting the transfer.
+						 */
+						goto aborted_xfer;
+					}
+					if (msg->err_pos >= 0)
+						http_capture_bad_message(&s->fe->invalid_req, s, req, msg, old_state, s->be);
 					goto return_bad_req;
+				}
 				return 1;
 			}
+
+			/* If "option abortonclose" is set on the backend, we
+			 * want to monitor the client's connection and forward
+			 * any shutdown notification to the server, which will
+			 * decide whether to close or to go on processing the
+			 * request.
+			 */
+			if (s->be->options & PR_O_ABRT_CLOSE) {
+				buffer_auto_read(req);
+				buffer_auto_close(req);
+			}
+			else if (s->txn.meth == HTTP_METH_POST) {
+				/* POST requests may require to read extra CRLF
+				 * sent by broken browsers and which could cause
+				 * an RST to be sent upon close on some systems
+				 * (eg: Linux).
+				 */
+				buffer_auto_read(req);
+			}
+
 			return 0;
 		}
 	}
@@ -4224,38 +4526,88 @@ int http_request_forward_body(struct session *s, struct buffer *req, int an_bit)
 	if (req->flags & BF_SHUTR) {
 		if (!(s->flags & SN_ERR_MASK))
 			s->flags |= SN_ERR_CLICL;
-		if (!(s->flags & SN_FINST_MASK))
-			s->flags |= SN_FINST_D;
-		goto return_bad_req;
+		if (!(s->flags & SN_FINST_MASK)) {
+			if (txn->rsp.msg_state < HTTP_MSG_ERROR)
+				s->flags |= SN_FINST_H;
+			else
+				s->flags |= SN_FINST_D;
+		}
+
+		s->fe->counters.cli_aborts++;
+		if (s->fe != s->be)
+			s->be->counters.cli_aborts++;
+		if (s->srv)
+			s->srv->counters.cli_aborts++;
+
+		goto return_bad_req_stats_ok;
 	}
 
 	/* waiting for the last bits to leave the buffer */
-	if (req->flags & BF_SHUTW) {
-		if (!(s->flags & SN_ERR_MASK))
-			s->flags |= SN_ERR_SRVCL;
-		if (!(s->flags & SN_FINST_MASK))
-			s->flags |= SN_FINST_D;
-		goto return_bad_req;
-	}
+	if (req->flags & BF_SHUTW)
+		goto aborted_xfer;
+
+	/* We know that more data are expected, but we couldn't send more that
+	 * what we did. So we always set the BF_EXPECT_MORE flag so that the
+	 * system knows it must not set a PUSH on this first part. Interactive
+	 * modes are already handled by the stream sock layer.
+	 */
+	req->flags |= BF_EXPECT_MORE;
 
 	http_silent_debug(__LINE__, s);
 	return 0;
 
  return_bad_req: /* let's centralize all bad requests */
-	txn->req.msg_state = HTTP_MSG_ERROR;
-	txn->status = 400;
-	/* Note: we don't send any error if some data were already sent */
-	stream_int_retnclose(req->prod, (txn->rsp.msg_state < HTTP_MSG_BODY) ? error_message(s, HTTP_ERR_400) : NULL);
-	req->analysers = 0;
 	s->fe->counters.failed_req++;
 	if (s->listener->counters)
 		s->listener->counters->failed_req++;
+ return_bad_req_stats_ok:
+	txn->req.msg_state = HTTP_MSG_ERROR;
+	if (txn->status) {
+		/* Note: we don't send any error if some data were already sent */
+		stream_int_retnclose(req->prod, NULL);
+	} else {
+		txn->status = 400;
+		stream_int_retnclose(req->prod, error_message(s, HTTP_ERR_400));
+	}
+	req->analysers = 0;
+	s->rep->analysers = 0; /* we're in data phase, we want to abort both directions */
 
 	if (!(s->flags & SN_ERR_MASK))
 		s->flags |= SN_ERR_PRXCOND;
-	if (!(s->flags & SN_FINST_MASK))
-		s->flags |= SN_FINST_R;
-	http_silent_debug(__LINE__, s);
+	if (!(s->flags & SN_FINST_MASK)) {
+		if (txn->rsp.msg_state < HTTP_MSG_ERROR)
+			s->flags |= SN_FINST_H;
+		else
+			s->flags |= SN_FINST_D;
+	}
+	return 0;
+
+ aborted_xfer:
+	txn->req.msg_state = HTTP_MSG_ERROR;
+	if (txn->status) {
+		/* Note: we don't send any error if some data were already sent */
+		stream_int_retnclose(req->prod, NULL);
+	} else {
+		txn->status = 502;
+		stream_int_retnclose(req->prod, error_message(s, HTTP_ERR_502));
+	}
+	req->analysers = 0;
+	s->rep->analysers = 0; /* we're in data phase, we want to abort both directions */
+
+	s->fe->counters.srv_aborts++;
+	if (s->fe != s->be)
+		s->be->counters.srv_aborts++;
+	if (s->srv)
+		s->srv->counters.srv_aborts++;
+
+	if (!(s->flags & SN_ERR_MASK))
+		s->flags |= SN_ERR_SRVCL;
+	if (!(s->flags & SN_FINST_MASK)) {
+		if (txn->rsp.msg_state < HTTP_MSG_ERROR)
+			s->flags |= SN_FINST_H;
+		else
+			s->flags |= SN_FINST_D;
+	}
 	return 0;
 }
 
@@ -4369,7 +4721,7 @@ int http_wait_for_response(struct session *s, struct buffer *rep, int an_bit)
 			 */
 		hdr_response_bad:
 			if (msg->msg_state == HTTP_MSG_ERROR || msg->err_pos >= 0)
-				http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, s->fe);
+				http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, msg->msg_state, s->fe);
 
 			s->be->counters.failed_resp++;
 			if (s->srv) {
@@ -4394,13 +4746,15 @@ int http_wait_for_response(struct session *s, struct buffer *rep, int an_bit)
 
 		/* too large response does not fit in buffer. */
 		else if (rep->flags & BF_FULL) {
+			if (msg->err_pos < 0)
+				msg->err_pos = rep->l;
 			goto hdr_response_bad;
 		}
 
 		/* read error */
 		else if (rep->flags & BF_READ_ERROR) {
 			if (msg->err_pos >= 0)
-				http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, s->fe);
+				http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, msg->msg_state, s->fe);
 
 			s->be->counters.failed_resp++;
 			if (s->srv) {
@@ -4425,7 +4779,7 @@ int http_wait_for_response(struct session *s, struct buffer *rep, int an_bit)
 		/* read timeout : return a 504 to the client. */
 		else if (rep->flags & BF_READ_TIMEOUT) {
 			if (msg->err_pos >= 0)
-				http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, s->fe);
+				http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, msg->msg_state, s->fe);
 
 			s->be->counters.failed_resp++;
 			if (s->srv) {
@@ -4447,10 +4801,10 @@ int http_wait_for_response(struct session *s, struct buffer *rep, int an_bit)
 			return 0;
 		}
 
-		/* close from server */
+		/* close from server, capture the response if the server has started to respond */
 		else if (rep->flags & BF_SHUTR) {
-			if (msg->err_pos >= 0)
-				http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, s->fe);
+			if (msg->msg_state >= HTTP_MSG_RPVER || msg->err_pos >= 0)
+				http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, msg->msg_state, s->fe);
 
 			s->be->counters.failed_resp++;
 			if (s->srv) {
@@ -4475,7 +4829,7 @@ int http_wait_for_response(struct session *s, struct buffer *rep, int an_bit)
 		/* write error to client (we don't send any message then) */
 		else if (rep->flags & BF_WRITE_ERROR) {
 			if (msg->err_pos >= 0)
-				http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, s->fe);
+				http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, msg->msg_state, s->fe);
 
 			s->be->counters.failed_resp++;
 			rep->analysers = 0;
@@ -4500,7 +4854,7 @@ int http_wait_for_response(struct session *s, struct buffer *rep, int an_bit)
 	 */
 
 	if (unlikely(msg->err_pos >= 0))
-		http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, s->fe);
+		http_capture_bad_message(&s->be->invalid_rep, s, rep, msg, msg->msg_state, s->fe);
 
 	/*
 	 * 1: get the status code
@@ -4616,7 +4970,7 @@ int http_wait_for_response(struct session *s, struct buffer *rep, int an_bit)
 	 */
 
 	/* Skip parsing if no content length is possible. The response flags
-	 * remain 0 as well as the hdr_content_len, which may or may not mirror
+	 * remain 0 as well as the chunk_len, which may or may not mirror
 	 * the real header value, and we note that we know the response's length.
 	 * FIXME: should we parse anyway and return an error on chunked encoding ?
 	 */
@@ -4647,20 +5001,28 @@ int http_wait_for_response(struct session *s, struct buffer *rep, int an_bit)
 	       http_find_header2("Content-Length", 14, msg->sol, &txn->hdr_idx, &ctx)) {
 		signed long long cl;
 
-		if (!ctx.vlen)
+		if (!ctx.vlen) {
+			msg->err_pos = ctx.line + ctx.val - rep->data;
 			goto hdr_response_bad;
+		}
 
-		if (strl2llrc(ctx.line + ctx.val, ctx.vlen, &cl))
+		if (strl2llrc(ctx.line + ctx.val, ctx.vlen, &cl)) {
+			msg->err_pos = ctx.line + ctx.val - rep->data;
 			goto hdr_response_bad; /* parse failure */
+		}
 
-		if (cl < 0)
+		if (cl < 0) {
+			msg->err_pos = ctx.line + ctx.val - rep->data;
 			goto hdr_response_bad;
+		}
 
-		if ((txn->flags & TX_RES_CNT_LEN) && (msg->hdr_content_len != cl))
+		if ((txn->flags & TX_RES_CNT_LEN) && (msg->chunk_len != cl)) {
+			msg->err_pos = ctx.line + ctx.val - rep->data;
 			goto hdr_response_bad; /* already specified, was different */
+		}
 
 		txn->flags |= TX_RES_CNT_LEN | TX_RES_XFER_LEN;
-		msg->hdr_content_len = cl;
+		msg->body_len = msg->chunk_len = cl;
 	}
 
 	/* FIXME: we should also implement the multipart/byterange method.
@@ -4876,19 +5238,47 @@ int http_process_res_common(struct session *t, struct buffer *rep, int an_bit, s
 		/*
 		 * 6: add server cookie in the response if needed
 		 */
-		if ((t->srv) && !(t->flags & SN_DIRECT) && (t->be->options & PR_O_COOK_INS) &&
+		if ((t->srv) && (t->be->options & PR_O_COOK_INS) &&
+		    !((txn->flags & TX_SCK_FOUND) && (t->be->options2 & PR_O2_COOK_PSV)) &&
+		    (!(t->flags & SN_DIRECT) ||
+		     ((t->be->cookie_maxidle || txn->cookie_last_date) &&
+		      (!txn->cookie_last_date || (txn->cookie_last_date - date.tv_sec) < 0)) ||
+		     (t->be->cookie_maxlife && !txn->cookie_first_date) ||  // set the first_date
+		     (!t->be->cookie_maxlife && txn->cookie_first_date)) && // remove the first_date
 		    (!(t->be->options & PR_O_COOK_POST) || (txn->meth == HTTP_METH_POST)) &&
 		    !(t->flags & SN_IGNORE_PRST)) {
 			int len;
-
-			/* the server is known, it's not the one the client requested, we have to
+			/* the server is known, it's not the one the client requested, or the
+			 * cookie's last seen date needs to be refreshed. We have to
 			 * insert a set-cookie here, except if we want to insert only on POST
 			 * requests and this one isn't. Note that servers which don't have cookies
 			 * (eg: some backup servers) will return a full cookie removal request.
 			 */
-			len = sprintf(trash, "Set-Cookie: %s=%s; path=/",
-				      t->be->cookie_name,
-				      t->srv->cookie ? t->srv->cookie : "; Expires=Thu, 01-Jan-1970 00:00:01 GMT");
+			if (!t->srv->cookie) {
+				len = sprintf(trash,
+					      "Set-Cookie: %s=; Expires=Thu, 01-Jan-1970 00:00:01 GMT; path=/",
+					      t->be->cookie_name);
+			}
+			else {
+				len = sprintf(trash, "Set-Cookie: %s=%s", t->be->cookie_name, t->srv->cookie);
+
+				if (t->be->cookie_maxidle || t->be->cookie_maxlife) {
+					/* emit last_date, which is mandatory */
+					trash[len++] = COOKIE_DELIM_DATE;
+					s30tob64((date.tv_sec+3) >> 2, trash + len); len += 5;
+					if (t->be->cookie_maxlife) {
+						/* emit first_date, which is either the original one or
+						 * the current date.
+						 */
+						trash[len++] = COOKIE_DELIM_DATE;
+						s30tob64(txn->cookie_first_date ?
+							 txn->cookie_first_date >> 2 :
+							 (date.tv_sec+3) >> 2, trash + len);
+						len += 5;
+					}
+				}
+				len += sprintf(trash + len, "; path=/");
+			}
 
 			if (t->be->cookie_domain)
 				len += sprintf(trash+len, "; domain=%s", t->be->cookie_domain);
@@ -4896,7 +5286,13 @@ int http_process_res_common(struct session *t, struct buffer *rep, int an_bit, s
 			if (unlikely(http_header_add_tail2(rep, &txn->rsp, &txn->hdr_idx,
 							   trash, len) < 0))
 				goto return_bad_resp;
-			txn->flags |= TX_SCK_INSERTED;
+
+			txn->flags &= ~TX_SCK_MASK;
+			if (t->srv->cookie && (t->flags & SN_DIRECT))
+				/* the server did not change, only the date was updated */
+				txn->flags |= TX_SCK_UPDATED;
+			else
+				txn->flags |= TX_SCK_INSERTED;
 
 			/* Here, we will tell an eventual cache on the client side that we don't
 			 * want it to cache this reply because HTTP/1.0 caches also cache cookies !
@@ -4918,8 +5314,8 @@ int http_process_res_common(struct session *t, struct buffer *rep, int an_bit, s
 		 * We'll block the response if security checks have caught
 		 * nasty things such as a cacheable cookie.
 		 */
-		if (((txn->flags & (TX_CACHEABLE | TX_CACHE_COOK | TX_SCK_ANY)) ==
-		     (TX_CACHEABLE | TX_CACHE_COOK | TX_SCK_ANY)) &&
+		if (((txn->flags & (TX_CACHEABLE | TX_CACHE_COOK | TX_SCK_PRESENT)) ==
+		     (TX_CACHEABLE | TX_CACHE_COOK | TX_SCK_PRESENT)) &&
 		    (t->be->options & PR_O_CHK_CACHE)) {
 
 			/* we're in presence of a cacheable response containing
@@ -5007,7 +5403,7 @@ int http_process_res_common(struct session *t, struct buffer *rep, int an_bit, s
  * remaining data and to resync after end of body. It expects the msg_state to
  * be between MSG_BODY and MSG_DONE (inclusive). It returns zero if it needs to
  * read more data, or 1 once we can go on with next request or end the session.
- * When in MSG_DATA or MSG_TRAILERS, it will automatically forward hdr_content_len
+ * When in MSG_DATA or MSG_TRAILERS, it will automatically forward chunk_len
  * bytes of pending data + the headers if not already done (between som and sov).
  * It eventually adjusts som to match sov after the data in between have been sent.
  */
@@ -5015,6 +5411,7 @@ int http_response_forward_body(struct session *s, struct buffer *res, int an_bit
 {
 	struct http_txn *txn = &s->txn;
 	struct http_msg *msg = &s->txn.rsp;
+	int bytes;
 
 	if (unlikely(msg->msg_state < HTTP_MSG_BODY))
 		return 0;
@@ -5047,16 +5444,19 @@ int http_response_forward_body(struct session *s, struct buffer *res, int an_bit
 	}
 
 	while (1) {
+		int bytes;
+
 		http_silent_debug(__LINE__, s);
 		/* we may have some data pending */
-		if (msg->hdr_content_len || msg->som != msg->sov) {
-			int bytes = msg->sov - msg->som;
-			if (bytes < 0) /* sov may have wrapped at the end */
-				bytes += res->size;
-			buffer_forward(res, bytes + msg->hdr_content_len);
-			msg->hdr_content_len = 0; /* don't forward that again */
+		bytes = msg->sov - msg->som;
+		if (msg->chunk_len || bytes) {
 			msg->som = msg->sov;
+			if (likely(bytes < 0)) /* sov may have wrapped at the end */
+				bytes += res->size;
+			msg->chunk_len += (unsigned int)bytes;
+			msg->chunk_len -= buffer_forward(res, msg->chunk_len);
 		}
+
 
 		if (msg->msg_state == HTTP_MSG_DATA) {
 			/* must still forward */
@@ -5070,15 +5470,18 @@ int http_response_forward_body(struct session *s, struct buffer *res, int an_bit
 				msg->msg_state = HTTP_MSG_DONE;
 		}
 		else if (msg->msg_state == HTTP_MSG_CHUNK_SIZE) {
-			/* read the chunk size and assign it to ->hdr_content_len, then
+			/* read the chunk size and assign it to ->chunk_len, then
 			 * set ->sov to point to the body and switch to DATA or TRAILERS state.
 			 */
 			int ret = http_parse_chunk_size(res, msg);
 
 			if (!ret)
 				goto missing_data;
-			else if (ret < 0)
+			else if (ret < 0) {
+				if (msg->err_pos >= 0)
+					http_capture_bad_message(&s->be->invalid_rep, s, res, msg, HTTP_MSG_CHUNK_SIZE, s->fe);
 				goto return_bad_res;
+			}
 			/* otherwise we're in HTTP_MSG_DATA or HTTP_MSG_TRAILERS state */
 		}
 		else if (msg->msg_state == HTTP_MSG_DATA_CRLF) {
@@ -5093,8 +5496,11 @@ int http_response_forward_body(struct session *s, struct buffer *res, int an_bit
 
 			if (!ret)
 				goto missing_data;
-			else if (ret < 0)
+			else if (ret < 0) {
+				if (msg->err_pos >= 0)
+					http_capture_bad_message(&s->be->invalid_rep, s, res, msg, HTTP_MSG_DATA_CRLF, s->fe);
 				goto return_bad_res;
+			}
 			/* we're in MSG_CHUNK_SIZE now */
 		}
 		else if (msg->msg_state == HTTP_MSG_TRAILERS) {
@@ -5102,19 +5508,33 @@ int http_response_forward_body(struct session *s, struct buffer *res, int an_bit
 
 			if (ret == 0)
 				goto missing_data;
-			else if (ret < 0)
+			else if (ret < 0) {
+				if (msg->err_pos >= 0)
+					http_capture_bad_message(&s->be->invalid_rep, s, res, msg, HTTP_MSG_TRAILERS, s->fe);
 				goto return_bad_res;
+			}
 			/* we're in HTTP_MSG_DONE now */
 		}
 		else {
+			int old_state = msg->msg_state;
+
 			/* other states, DONE...TUNNEL */
 			if (http_resync_states(s)) {
 				http_silent_debug(__LINE__, s);
 				/* some state changes occurred, maybe the analyser
 				 * was disabled too.
 				 */
-				if (unlikely(msg->msg_state == HTTP_MSG_ERROR))
+				if (unlikely(msg->msg_state == HTTP_MSG_ERROR)) {
+					if (res->flags & BF_SHUTW) {
+						/* response errors are most likely due to
+						 * the client aborting the transfer.
+						 */
+						goto aborted_xfer;
+					}
+					if (msg->err_pos >= 0)
+						http_capture_bad_message(&s->be->invalid_rep, s, res, msg, old_state, s->fe);
 					goto return_bad_res;
+				}
 				return 1;
 			}
 			return 0;
@@ -5129,40 +5549,74 @@ int http_response_forward_body(struct session *s, struct buffer *res, int an_bit
 		s->be->counters.srv_aborts++;
 		if (s->srv)
 			s->srv->counters.srv_aborts++;
-		goto return_bad_res;
+		goto return_bad_res_stats_ok;
 	}
+
+	if (res->flags & BF_SHUTW)
+		goto aborted_xfer;
 
 	/* we need to obey the req analyser, so if it leaves, we must too */
 	if (!s->req->analysers)
 		goto return_bad_res;
 
-	/* forward the chunk size as well as any pending data */
-	if (msg->hdr_content_len || msg->som != msg->sov) {
-		buffer_forward(res, msg->sov - msg->som + msg->hdr_content_len);
-		msg->hdr_content_len = 0; /* don't forward that again */
+	/* forward any pending data */
+	bytes = msg->sov - msg->som;
+	if (msg->chunk_len || bytes) {
 		msg->som = msg->sov;
+		if (likely(bytes < 0)) /* sov may have wrapped at the end */
+			bytes += res->size;
+		msg->chunk_len += (unsigned int)bytes;
+		msg->chunk_len -= buffer_forward(res, msg->chunk_len);
 	}
+
+	/* We know that more data are expected, but we couldn't send more that
+	 * what we did. So we always set the BF_EXPECT_MORE flag so that the
+	 * system knows it must not set a PUSH on this first part. Interactive
+	 * modes are already handled by the stream sock layer.
+	 */
+	res->flags |= BF_EXPECT_MORE;
 
 	/* the session handler will take care of timeouts and errors */
 	http_silent_debug(__LINE__, s);
 	return 0;
 
  return_bad_res: /* let's centralize all bad responses */
+	s->be->counters.failed_resp++;
+	if (s->srv)
+		s->srv->counters.failed_resp++;
+
+ return_bad_res_stats_ok:
 	txn->rsp.msg_state = HTTP_MSG_ERROR;
 	/* don't send any error message as we're in the body */
 	stream_int_retnclose(res->cons, NULL);
 	res->analysers = 0;
-	s->be->counters.failed_resp++;
-	if (s->srv) {
-		s->srv->counters.failed_resp++;
+	s->req->analysers = 0; /* we're in data phase, we want to abort both directions */
+	if (s->srv)
 		health_adjust(s->srv, HANA_STATUS_HTTP_HDRRSP);
-	}
 
 	if (!(s->flags & SN_ERR_MASK))
 		s->flags |= SN_ERR_PRXCOND;
 	if (!(s->flags & SN_FINST_MASK))
 		s->flags |= SN_FINST_D;
-	http_silent_debug(__LINE__, s);
+	return 0;
+
+ aborted_xfer:
+	txn->rsp.msg_state = HTTP_MSG_ERROR;
+	/* don't send any error message as we're in the body */
+	stream_int_retnclose(res->cons, NULL);
+	res->analysers = 0;
+	s->req->analysers = 0; /* we're in data phase, we want to abort both directions */
+
+	s->fe->counters.cli_aborts++;
+	if (s->fe != s->be)
+		s->be->counters.cli_aborts++;
+	if (s->srv)
+		s->srv->counters.cli_aborts++;
+
+	if (!(s->flags & SN_ERR_MASK))
+		s->flags |= SN_ERR_CLICL;
+	if (!(s->flags & SN_FINST_MASK))
+		s->flags |= SN_FINST_D;
 	return 0;
 }
 
@@ -5241,7 +5695,7 @@ int apply_filter_to_req_headers(struct session *t, struct buffer *req, struct hd
 
 				t->be->counters.denied_req++;
 				if (t->listener->counters)
-					t->listener->counters->denied_resp++;
+					t->listener->counters->denied_req++;
 
 				break;
 
@@ -5251,7 +5705,7 @@ int apply_filter_to_req_headers(struct session *t, struct buffer *req, struct hd
 
 				t->be->counters.denied_req++;
 				if (t->listener->counters)
-					t->listener->counters->denied_resp++;
+					t->listener->counters->denied_req++;
 
 				break;
 
@@ -5278,6 +5732,7 @@ int apply_filter_to_req_headers(struct session *t, struct buffer *req, struct hd
 				txn->hdr_idx.used--;
 				cur_hdr->len = 0;
 				cur_end = NULL; /* null-term has been rewritten */
+				cur_idx = old_idx;
 				break;
 
 			}
@@ -5359,7 +5814,7 @@ int apply_filter_to_req_line(struct session *t, struct buffer *req, struct hdr_e
 
 			t->be->counters.denied_req++;
 			if (t->listener->counters)
-				t->listener->counters->denied_resp++;
+				t->listener->counters->denied_req++;
 
 			done = 1;
 			break;
@@ -5369,7 +5824,7 @@ int apply_filter_to_req_line(struct session *t, struct buffer *req, struct hdr_e
 
 			t->be->counters.denied_req++;
 			if (t->listener->counters)
-				t->listener->counters->denied_resp++;
+				t->listener->counters->denied_req++;
 
 			done = 1;
 			break;
@@ -5538,45 +5993,121 @@ void manage_client_side_appsession(struct session *t, const char *buf, int len) 
 	}
 }
 
+/* Find the end of a cookie value contained between <s> and <e>. It works the
+ * same way as with headers above except that the semi-colon also ends a token.
+ * See RFC2965 for more information. Note that it requires a valid header to
+ * return a valid result.
+ */
+char *find_cookie_value_end(char *s, const char *e)
+{
+	int quoted, qdpair;
+
+	quoted = qdpair = 0;
+	for (; s < e; s++) {
+		if (qdpair)                    qdpair = 0;
+		else if (quoted) {
+			if (*s == '\\')        qdpair = 1;
+			else if (*s == '"')    quoted = 0;
+		}
+		else if (*s == '"')            quoted = 1;
+		else if (*s == ',' || *s == ';') return s;
+	}
+	return s;
+}
+
+/* Delete a value in a header between delimiters <from> and <next> in buffer
+ * <buf>. The number of characters displaced is returned, and the pointer to
+ * the first delimiter is updated if required. The function tries as much as
+ * possible to respect the following principles :
+ *  - replace <from> delimiter by the <next> one unless <from> points to a
+ *    colon, in which case <next> is simply removed
+ *  - set exactly one space character after the new first delimiter, unless
+ *    there are not enough characters in the block being moved to do so.
+ *  - remove unneeded spaces before the previous delimiter and after the new
+ *    one.
+ *
+ * It is the caller's responsibility to ensure that :
+ *   - <from> points to a valid delimiter or the colon ;
+ *   - <next> points to a valid delimiter or the final CR/LF ;
+ *   - there are non-space chars before <from> ;
+ *   - there is a CR/LF at or after <next>.
+ */
+int del_hdr_value(struct buffer *buf, char **from, char *next)
+{
+	char *prev = *from;
+
+	if (*prev == ':') {
+		/* We're removing the first value, preserve the colon and add a
+		 * space if possible.
+		 */
+		if (!http_is_crlf[(unsigned char)*next])
+			next++;
+		prev++;
+		if (prev < next)
+			*prev++ = ' ';
+
+		while (http_is_spht[(unsigned char)*next])
+			next++;
+	} else {
+		/* Remove useless spaces before the old delimiter. */
+		while (http_is_spht[(unsigned char)*(prev-1)])
+			prev--;
+		*from = prev;
+
+		/* copy the delimiter and if possible a space if we're
+		 * not at the end of the line.
+		 */
+		if (!http_is_crlf[(unsigned char)*next]) {
+			*prev++ = *next++;
+			if (prev + 1 < next)
+				*prev++ = ' ';
+			while (http_is_spht[(unsigned char)*next])
+				next++;
+		}
+	}
+	return buffer_replace2(buf, prev, next, NULL, 0);
+}
+
 /*
  * Manage client-side cookie. It can impact performance by about 2% so it is
- * desirable to call it only when needed.
+ * desirable to call it only when needed. This code is quite complex because
+ * of the multiple very crappy and ambiguous syntaxes we have to support. it
+ * highly recommended not to touch this part without a good reason !
  */
 void manage_client_side_cookies(struct session *t, struct buffer *req)
 {
 	struct http_txn *txn = &t->txn;
-	char *p1, *p2, *p3, *p4, *p5;
-	char *del_colon, *del_cookie, *colon;
-	int app_cookies;
-
-	char *cur_ptr, *cur_end, *cur_next;
+	int preserve_hdr;
 	int cur_idx, old_idx;
+	char *hdr_beg, *hdr_end, *hdr_next, *del_from;
+	char *prev, *att_beg, *att_end, *equal, *val_beg, *val_end, *next;
 
-	/* Iterate through the headers.
-	 * we start with the start line.
-	 */
+	/* Iterate through the headers, we start with the start line. */
 	old_idx = 0;
-	cur_next = txn->req.sol + hdr_idx_first_pos(&txn->hdr_idx);
+	hdr_next = txn->req.sol + hdr_idx_first_pos(&txn->hdr_idx);
 
 	while ((cur_idx = txn->hdr_idx.v[old_idx].next)) {
 		struct hdr_idx_elem *cur_hdr;
 		int val;
 
 		cur_hdr  = &txn->hdr_idx.v[cur_idx];
-		cur_ptr  = cur_next;
-		cur_end  = cur_ptr + cur_hdr->len;
-		cur_next = cur_end + cur_hdr->cr + 1;
+		hdr_beg  = hdr_next;
+		hdr_end  = hdr_beg + cur_hdr->len;
+		hdr_next = hdr_end + cur_hdr->cr + 1;
 
-		/* We have one full header between cur_ptr and cur_end, and the
-		 * next header starts at cur_next. We're only interested in
+		/* We have one full header between hdr_beg and hdr_end, and the
+		 * next header starts at hdr_next. We're only interested in
 		 * "Cookie:" headers.
 		 */
 
-		val = http_header_match2(cur_ptr, cur_end, "Cookie", 6);
+		val = http_header_match2(hdr_beg, hdr_end, "Cookie", 6);
 		if (!val) {
 			old_idx = cur_idx;
 			continue;
 		}
+
+		del_from = NULL;  /* nothing to be deleted */
+		preserve_hdr = 0; /* assume we may kill the whole header */
 
 		/* Now look for cookies. Conforming to RFC2109, we have to support
 		 * attributes whose name begin with a '$', and associate them with
@@ -5589,267 +6120,400 @@ void manage_client_side_cookies(struct session *t, struct buffer *req)
 		 *    "special" cookie.
 		 * At the end of loop, if a "special" cookie remains, we may have to
 		 * remove it. If no application cookie persists in the header, we
-		 * *MUST* delete it
+		 * *MUST* delete it.
+		 *
+		 * Note: RFC2965 is unclear about the processing of spaces around
+		 * the equal sign in the ATTR=VALUE form. A careful inspection of
+		 * the RFC explicitly allows spaces before it, and not within the
+		 * tokens (attrs or values). An inspection of RFC2109 allows that
+		 * too but section 10.1.3 lets one think that spaces may be allowed
+		 * after the equal sign too, resulting in some (rare) buggy
+		 * implementations trying to do that. So let's do what servers do.
+		 * Latest ietf draft forbids spaces all around. Also, earlier RFCs
+		 * allowed quoted strings in values, with any possible character
+		 * after a backslash, including control chars and delimitors, which
+		 * causes parsing to become ambiguous. Browsers also allow spaces
+		 * within values even without quotes.
+		 *
+		 * We have to keep multiple pointers in order to support cookie
+		 * removal at the beginning, middle or end of header without
+		 * corrupting the header. All of these headers are valid :
+		 *
+		 * Cookie:NAME1=VALUE1;NAME2=VALUE2;NAME3=VALUE3\r\n
+		 * Cookie:NAME1=VALUE1;NAME2_ONLY ;NAME3=VALUE3\r\n
+		 * Cookie:    NAME1  =  VALUE 1  ; NAME2 = VALUE2 ; NAME3 = VALUE3\r\n
+		 * |     |    |    | |  |      | |                                |
+		 * |     |    |    | |  |      | |                     hdr_end <--+
+		 * |     |    |    | |  |      | +--> next
+		 * |     |    |    | |  |      +----> val_end
+		 * |     |    |    | |  +-----------> val_beg
+		 * |     |    |    | +--------------> equal
+		 * |     |    |    +----------------> att_end
+		 * |     |    +---------------------> att_beg
+		 * |     +--------------------------> prev
+		 * +--------------------------------> hdr_beg
 		 */
 
-		colon = p1 = cur_ptr + val; /* first non-space char after 'Cookie:' */
+		for (prev = hdr_beg + 6; prev < hdr_end; prev = next) {
+			/* Iterate through all cookies on this line */
 
-		/* del_cookie == NULL => nothing to be deleted */
-		del_colon = del_cookie = NULL;
-		app_cookies = 0;
-		
-		while (p1 < cur_end) {
-			/* skip spaces and colons, but keep an eye on these ones */
-		resync_name:
-			while (p1 < cur_end) {
-				if (*p1 == ';' || *p1 == ',')
-					colon = p1;
-				else if (!isspace((unsigned char)*p1))
-					break;
-				p1++;
-			}
+			/* find att_beg */
+			att_beg = prev + 1;
+			while (att_beg < hdr_end && http_is_spht[(unsigned char)*att_beg])
+				att_beg++;
 
-			if (p1 == cur_end)
-				break;
-		    
-			/* p1 is at the beginning of the cookie name */
-			p2 = p1;
-			while (p2 < cur_end && *p2 != '=') {
-				if (*p2 == ',' || *p2 == ';' || isspace((unsigned char)*p2)) {
-					/* oops, the cookie name was truncated, resync */
-					p1 = p2;
-					goto resync_name;
-				}
-				p2++;
-			}
-
-			if (p2 == cur_end)
-				break;
-
-			p3 = p2 + 1; /* skips the '=' sign */
-			if (p3 == cur_end)
-				break;
-		    
-			/* parse the value, stripping leading and trailing spaces but keeping insiders. */
-			p5 = p4 = p3;
-			while (p5 < cur_end && *p5 != ';' && *p5 != ',') {
-				if (!isspace((unsigned char)*p5))
-					p4 = p5 + 1;
-				p5++;
-			}
-
-			/* here, we have the cookie name between p1 and p2,
-			 * and its value between p3 and p4.
-			 * we can process it :
-			 *
-			 * Cookie: NAME=VALUE ;
-			 * |      ||   ||    |+-> p5
-			 * |      ||   ||    +--> p4
-			 * |      ||   |+-------> p3
-			 * |      ||   +--------> p2
-			 * |      |+------------> p1
-			 * |      +-------------> colon
-			 * +--------------------> cur_ptr
+			/* find att_end : this is the first character after the last non
+			 * space before the equal. It may be equal to hdr_end.
 			 */
-		    
-			if (*p1 == '$') {
-				/* skip this one */
-			}
-			else {
-				/* first, let's see if we want to capture it */
-				if (t->fe->capture_name != NULL &&
-				    txn->cli_cookie == NULL &&
-				    (p4 - p1 >= t->fe->capture_namelen) &&
-				    memcmp(p1, t->fe->capture_name, t->fe->capture_namelen) == 0) {
-					int log_len = p4 - p1;
+			equal = att_end = att_beg;
 
-					if ((txn->cli_cookie = pool_alloc2(pool2_capture)) == NULL) {
-						Alert("HTTP logging : out of memory.\n");
-					} else {
-						if (log_len > t->fe->capture_len)
-							log_len = t->fe->capture_len;
-						memcpy(txn->cli_cookie, p1, log_len);
-						txn->cli_cookie[log_len] = 0;
-					}
+			while (equal < hdr_end) {
+				if (*equal == '=' || *equal == ',' || *equal == ';')
+					break;
+				if (http_is_spht[(unsigned char)*equal++])
+					continue;
+				att_end = equal;
+			}
+
+			/* here, <equal> points to '=', a delimitor or the end. <att_end>
+			 * is between <att_beg> and <equal>, both may be identical.
+			 */
+
+			/* look for end of cookie if there is an equal sign */
+			if (equal < hdr_end && *equal == '=') {
+				/* look for the beginning of the value */
+				val_beg = equal + 1;
+				while (val_beg < hdr_end && http_is_spht[(unsigned char)*val_beg])
+					val_beg++;
+
+				/* find the end of the value, respecting quotes */
+				next = find_cookie_value_end(val_beg, hdr_end);
+
+				/* make val_end point to the first white space or delimitor after the value */
+				val_end = next;
+				while (val_end > val_beg && http_is_spht[(unsigned char)*(val_end - 1)])
+					val_end--;
+			} else {
+				val_beg = val_end = next = equal;
+			}
+
+			/* We have nothing to do with attributes beginning with '$'. However,
+			 * they will automatically be removed if a header before them is removed,
+			 * since they're supposed to be linked together.
+			 */
+			if (*att_beg == '$')
+				continue;
+
+			/* Ignore cookies with no equal sign */
+			if (equal == next) {
+				/* This is not our cookie, so we must preserve it. But if we already
+				 * scheduled another cookie for removal, we cannot remove the
+				 * complete header, but we can remove the previous block itself.
+				 */
+				preserve_hdr = 1;
+				if (del_from != NULL) {
+					int delta = del_hdr_value(req, &del_from, prev);
+					val_end  += delta;
+					next     += delta;
+					hdr_end  += delta;
+					hdr_next += delta;
+					cur_hdr->len += delta;
+					http_msg_move_end(&txn->req, delta);
+					prev     = del_from;
+					del_from = NULL;
+				}
+				continue;
+			}
+
+			/* if there are spaces around the equal sign, we need to
+			 * strip them otherwise we'll get trouble for cookie captures,
+			 * or even for rewrites. Since this happens extremely rarely,
+			 * it does not hurt performance.
+			 */
+			if (unlikely(att_end != equal || val_beg > equal + 1)) {
+				int stripped_before = 0;
+				int stripped_after = 0;
+
+				if (att_end != equal) {
+					stripped_before = buffer_replace2(req, att_end, equal, NULL, 0);
+					equal   += stripped_before;
+					val_beg += stripped_before;
 				}
 
-				if ((p2 - p1 == t->be->cookie_len) && (t->be->cookie_name != NULL) &&
-				    (memcmp(p1, t->be->cookie_name, p2 - p1) == 0)) {
-					/* Cool... it's the right one */
-					struct server *srv = t->be->srv;
-					char *delim;
+				if (val_beg > equal + 1) {
+					stripped_after = buffer_replace2(req, equal + 1, val_beg, NULL, 0);
+					val_beg += stripped_after;
+					stripped_before += stripped_after;
+				}
 
-					/* if we're in cookie prefix mode, we'll search the delimitor so that we
-					 * have the server ID betweek p3 and delim, and the original cookie between
-					 * delim+1 and p4. Otherwise, delim==p4 :
-					 *
-					 * Cookie: NAME=SRV~VALUE ;
-					 * |      ||   ||  |     |+-> p5
-					 * |      ||   ||  |     +--> p4
-					 * |      ||   ||  +--------> delim
-					 * |      ||   |+-----------> p3
-					 * |      ||   +------------> p2
-					 * |      |+----------------> p1
-					 * |      +-----------------> colon
-					 * +------------------------> cur_ptr
-					 */
+				val_end      += stripped_before;
+				next         += stripped_before;
+				hdr_end      += stripped_before;
+				hdr_next     += stripped_before;
+				cur_hdr->len += stripped_before;
+				http_msg_move_end(&txn->req, stripped_before);
+			}
+			/* now everything is as on the diagram above */
 
-					if (t->be->options & PR_O_COOK_PFX) {
-						for (delim = p3; delim < p4; delim++)
-							if (*delim == COOKIE_DELIM)
-								break;
-					}
-					else
-						delim = p4;
+			/* First, let's see if we want to capture this cookie. We check
+			 * that we don't already have a client side cookie, because we
+			 * can only capture one. Also as an optimisation, we ignore
+			 * cookies shorter than the declared name.
+			 */
+			if (t->fe->capture_name != NULL && txn->cli_cookie == NULL &&
+			    (val_end - att_beg >= t->fe->capture_namelen) &&
+			    memcmp(att_beg, t->fe->capture_name, t->fe->capture_namelen) == 0) {
+				int log_len = val_end - att_beg;
 
-
-					/* Here, we'll look for the first running server which supports the cookie.
-					 * This allows to share a same cookie between several servers, for example
-					 * to dedicate backup servers to specific servers only.
-					 * However, to prevent clients from sticking to cookie-less backup server
-					 * when they have incidentely learned an empty cookie, we simply ignore
-					 * empty cookies and mark them as invalid.
-					 * The same behaviour is applied when persistence must be ignored.
-					 */
-					if ((delim == p3) || (t->flags & SN_IGNORE_PRST))
-						srv = NULL;
-
-					while (srv) {
-						if (srv->cookie && (srv->cklen == delim - p3) &&
-						    !memcmp(p3, srv->cookie, delim - p3)) {
-							if ((srv->state & SRV_RUNNING) ||
-							    (t->be->options & PR_O_PERSIST) ||
-							    (t->flags & SN_FORCE_PRST)) {
-								/* we found the server and it's usable */
-								txn->flags &= ~TX_CK_MASK;
-								txn->flags |= (srv->state & SRV_RUNNING) ? TX_CK_VALID : TX_CK_DOWN;
-								t->flags |= SN_DIRECT | SN_ASSIGNED;
-								t->srv = srv;
-								break;
-							} else {
-								/* we found a server, but it's down */
-								txn->flags &= ~TX_CK_MASK;
-								txn->flags |= TX_CK_DOWN;
-							}
-						}
-						srv = srv->next;
-					}
-
-					if (!srv && !(txn->flags & TX_CK_DOWN)) {
-						/* no server matched this cookie */
-						txn->flags &= ~TX_CK_MASK;
-						txn->flags |= TX_CK_INVALID;
-					}
-
-					/* depending on the cookie mode, we may have to either :
-					 * - delete the complete cookie if we're in insert+indirect mode, so that
-					 *   the server never sees it ;
-					 * - remove the server id from the cookie value, and tag the cookie as an
-					 *   application cookie so that it does not get accidentely removed later,
-					 *   if we're in cookie prefix mode
-					 */
-					if ((t->be->options & PR_O_COOK_PFX) && (delim != p4)) {
-						int delta; /* negative */
-
-						delta = buffer_replace2(req, p3, delim + 1, NULL, 0);
-						p4  += delta;
-						p5  += delta;
-						cur_end += delta;
-						cur_next += delta;
-						cur_hdr->len += delta;
-						http_msg_move_end(&txn->req, delta);
-
-						del_cookie = del_colon = NULL;
-						app_cookies++;	/* protect the header from deletion */
-					}
-					else if (del_cookie == NULL &&
-						 (t->be->options & (PR_O_COOK_INS | PR_O_COOK_IND)) == (PR_O_COOK_INS | PR_O_COOK_IND)) {
-						del_cookie = p1;
-						del_colon = colon;
-					}
+				if ((txn->cli_cookie = pool_alloc2(pool2_capture)) == NULL) {
+					Alert("HTTP logging : out of memory.\n");
 				} else {
-					/* now we know that we must keep this cookie since it's
-					 * not ours. But if we wanted to delete our cookie
-					 * earlier, we cannot remove the complete header, but we
-					 * can remove the previous block itself.
+					if (log_len > t->fe->capture_len)
+						log_len = t->fe->capture_len;
+					memcpy(txn->cli_cookie, att_beg, log_len);
+					txn->cli_cookie[log_len] = 0;
+				}
+			}
+
+			/* Persistence cookies in passive, rewrite or insert mode have the
+			 * following form :
+			 *
+			 *    Cookie: NAME=SRV[|<lastseen>[|<firstseen>]]
+			 *
+			 * For cookies in prefix mode, the form is :
+			 *
+			 *    Cookie: NAME=SRV~VALUE
+			 */
+			if ((att_end - att_beg == t->be->cookie_len) && (t->be->cookie_name != NULL) &&
+			    (memcmp(att_beg, t->be->cookie_name, att_end - att_beg) == 0)) {
+				struct server *srv = t->be->srv;
+				char *delim;
+
+				/* if we're in cookie prefix mode, we'll search the delimitor so that we
+				 * have the server ID between val_beg and delim, and the original cookie between
+				 * delim+1 and val_end. Otherwise, delim==val_end :
+				 *
+				 * Cookie: NAME=SRV;          # in all but prefix modes
+				 * Cookie: NAME=SRV~OPAQUE ;  # in prefix mode
+				 * |      ||   ||  |      |+-> next
+				 * |      ||   ||  |      +--> val_end
+				 * |      ||   ||  +---------> delim
+				 * |      ||   |+------------> val_beg
+				 * |      ||   +-------------> att_end = equal
+				 * |      |+-----------------> att_beg
+				 * |      +------------------> prev
+				 * +-------------------------> hdr_beg
+				 */
+
+				if (t->be->options & PR_O_COOK_PFX) {
+					for (delim = val_beg; delim < val_end; delim++)
+						if (*delim == COOKIE_DELIM)
+							break;
+				} else {
+					char *vbar1;
+					delim = val_end;
+					/* Now check if the cookie contains a date field, which would
+					 * appear after a vertical bar ('|') just after the server name
+					 * and before the delimiter.
 					 */
-					app_cookies++;
-
-					if (del_cookie != NULL) {
-						int delta; /* negative */
-
-						delta = buffer_replace2(req, del_cookie, p1, NULL, 0);
-						p4  += delta;
-						p5  += delta;
-						cur_end += delta;
-						cur_next += delta;
-						cur_hdr->len += delta;
-						http_msg_move_end(&txn->req, delta);
-						del_cookie = del_colon = NULL;
+					vbar1 = memchr(val_beg, COOKIE_DELIM_DATE, val_end - val_beg);
+					if (vbar1) {
+						/* OK, so left of the bar is the server's cookie and
+						 * right is the last seen date. It is a base64 encoded
+						 * 30-bit value representing the UNIX date since the
+						 * epoch in 4-second quantities.
+						 */
+						int val;
+						delim = vbar1++;
+						if (val_end - vbar1 >= 5) {
+							val = b64tos30(vbar1);
+							if (val > 0)
+								txn->cookie_last_date = val << 2;
+						}
+						/* look for a second vertical bar */
+						vbar1 = memchr(vbar1, COOKIE_DELIM_DATE, val_end - vbar1);
+						if (vbar1 && (val_end - vbar1 > 5)) {
+							val = b64tos30(vbar1 + 1);
+							if (val > 0)
+								txn->cookie_first_date = val << 2;
+						}
 					}
 				}
 
-				/* Look for the appsession cookie unless persistence must be ignored */
-				if (!(t->flags & SN_IGNORE_PRST) && (t->be->appsession_name != NULL)) {
-					int cmp_len, value_len;
-					char *value_begin;
+				/* if the cookie has an expiration date and the proxy wants to check
+				 * it, then we do that now. We first check if the cookie is too old,
+				 * then only if it has expired. We detect strict overflow because the
+				 * time resolution here is not great (4 seconds). Cookies with dates
+				 * in the future are ignored if their offset is beyond one day. This
+				 * allows an admin to fix timezone issues without expiring everyone
+				 * and at the same time avoids keeping unwanted side effects for too
+				 * long.
+				 */
+				if (txn->cookie_first_date && t->be->cookie_maxlife &&
+				    (((signed)(date.tv_sec - txn->cookie_first_date) > (signed)t->be->cookie_maxlife) ||
+				     ((signed)(txn->cookie_first_date - date.tv_sec) > 86400))) {
+					txn->flags &= ~TX_CK_MASK;
+					txn->flags |= TX_CK_OLD;
+					delim = val_beg; // let's pretend we have not found the cookie
+					txn->cookie_first_date = 0;
+					txn->cookie_last_date = 0;
+				}
+				else if (txn->cookie_last_date && t->be->cookie_maxidle &&
+					 (((signed)(date.tv_sec - txn->cookie_last_date) > (signed)t->be->cookie_maxidle) ||
+					  ((signed)(txn->cookie_last_date - date.tv_sec) > 86400))) {
+					txn->flags &= ~TX_CK_MASK;
+					txn->flags |= TX_CK_EXPIRED;
+					delim = val_beg; // let's pretend we have not found the cookie
+					txn->cookie_first_date = 0;
+					txn->cookie_last_date = 0;
+				}
 
-					if (t->be->options2 & PR_O2_AS_PFX) {
-						cmp_len = MIN(p4 - p1, t->be->appsession_name_len);
-						value_begin = p1 + t->be->appsession_name_len;
-						value_len = p4 - p1 - t->be->appsession_name_len;
-					} else {
-						cmp_len = p2 - p1;
-						value_begin = p3;
-						value_len = p4 - p3;
-					}
+				/* Here, we'll look for the first running server which supports the cookie.
+				 * This allows to share a same cookie between several servers, for example
+				 * to dedicate backup servers to specific servers only.
+				 * However, to prevent clients from sticking to cookie-less backup server
+				 * when they have incidentely learned an empty cookie, we simply ignore
+				 * empty cookies and mark them as invalid.
+				 * The same behaviour is applied when persistence must be ignored.
+				 */
+				if ((delim == val_beg) || (t->flags & SN_IGNORE_PRST))
+					srv = NULL;
 
-					/* let's see if the cookie is our appcookie */
-					if ((cmp_len == t->be->appsession_name_len) &&
-					    (memcmp(p1, t->be->appsession_name, t->be->appsession_name_len) == 0)) {
-						/* Cool... it's the right one */
-						manage_client_side_appsession(t, value_begin, value_len);
+				while (srv) {
+					if (srv->cookie && (srv->cklen == delim - val_beg) &&
+					    !memcmp(val_beg, srv->cookie, delim - val_beg)) {
+						if ((srv->state & SRV_RUNNING) ||
+						    (t->be->options & PR_O_PERSIST) ||
+						    (t->flags & SN_FORCE_PRST)) {
+							/* we found the server and we can use it */
+							txn->flags &= ~TX_CK_MASK;
+							txn->flags |= (srv->state & SRV_RUNNING) ? TX_CK_VALID : TX_CK_DOWN;
+							t->flags |= SN_DIRECT | SN_ASSIGNED;
+							t->srv = srv;
+							break;
+						} else {
+							/* we found a server, but it's down,
+							 * mark it as such and go on in case
+							 * another one is available.
+							 */
+							txn->flags &= ~TX_CK_MASK;
+							txn->flags |= TX_CK_DOWN;
+						}
 					}
-#if defined(DEBUG_HASH)
-					Alert("manage_client_side_cookies\n");
-					appsession_hash_dump(&(t->be->htbl_proxy));
-#endif
-				}/* end if ((t->proxy->appsession_name != NULL) ... */
+					srv = srv->next;
+				}
+
+				if (!srv && !(txn->flags & (TX_CK_DOWN|TX_CK_EXPIRED|TX_CK_OLD))) {
+					/* no server matched this cookie */
+					txn->flags &= ~TX_CK_MASK;
+					txn->flags |= TX_CK_INVALID;
+				}
+
+				/* depending on the cookie mode, we may have to either :
+				 * - delete the complete cookie if we're in insert+indirect mode, so that
+				 *   the server never sees it ;
+				 * - remove the server id from the cookie value, and tag the cookie as an
+				 *   application cookie so that it does not get accidentely removed later,
+				 *   if we're in cookie prefix mode
+				 */
+				if ((t->be->options & PR_O_COOK_PFX) && (delim != val_end)) {
+					int delta; /* negative */
+
+					delta = buffer_replace2(req, val_beg, delim + 1, NULL, 0);
+					val_end  += delta;
+					next     += delta;
+					hdr_end  += delta;
+					hdr_next += delta;
+					cur_hdr->len += delta;
+					http_msg_move_end(&txn->req, delta);
+
+					del_from = NULL;
+					preserve_hdr = 1; /* we want to keep this cookie */
+				}
+				else if (del_from == NULL &&
+					 (t->be->options & (PR_O_COOK_INS | PR_O_COOK_IND)) == (PR_O_COOK_INS | PR_O_COOK_IND)) {
+					del_from = prev;
+				}
+			} else {
+				/* This is not our cookie, so we must preserve it. But if we already
+				 * scheduled another cookie for removal, we cannot remove the
+				 * complete header, but we can remove the previous block itself.
+				 */
+				preserve_hdr = 1;
+
+				if (del_from != NULL) {
+					int delta = del_hdr_value(req, &del_from, prev);
+					if (att_beg >= del_from)
+						att_beg += delta;
+					if (att_end >= del_from)
+						att_end += delta;
+					val_beg  += delta;
+					val_end  += delta;
+					next     += delta;
+					hdr_end  += delta;
+					hdr_next += delta;
+					cur_hdr->len += delta;
+					http_msg_move_end(&txn->req, delta);
+					prev     = del_from;
+					del_from = NULL;
+				}
 			}
 
-			/* we'll have to look for another cookie ... */
-			p1 = p5;
-		} /* while (p1 < cur_end) */
+			/* Look for the appsession cookie unless persistence must be ignored */
+			if (!(t->flags & SN_IGNORE_PRST) && (t->be->appsession_name != NULL)) {
+				int cmp_len, value_len;
+				char *value_begin;
 
-		/* There's no more cookie on this line.
-		 * We may have marked the last one(s) for deletion.
-		 * We must do this now in two ways :
-		 *  - if there is no app cookie, we simply delete the header ;
-		 *  - if there are app cookies, we must delete the end of the
-		 *    string properly, including the colon/semi-colon before
-		 *    the cookie name.
+				if (t->be->options2 & PR_O2_AS_PFX) {
+					cmp_len     = MIN(val_end - att_beg, t->be->appsession_name_len);
+					value_begin = att_beg + t->be->appsession_name_len;
+					value_len   = val_end - att_beg - t->be->appsession_name_len;
+				} else {
+					cmp_len     = att_end - att_beg;
+					value_begin = val_beg;
+					value_len   = val_end - val_beg;
+				}
+
+				/* let's see if the cookie is our appcookie */
+				if (cmp_len == t->be->appsession_name_len &&
+				    memcmp(att_beg, t->be->appsession_name, cmp_len) == 0) {
+					manage_client_side_appsession(t, value_begin, value_len);
+				}
+			}
+
+			/* continue with next cookie on this header line */
+			att_beg = next;
+		} /* for each cookie */
+
+		/* There are no more cookies on this line.
+		 * We may still have one (or several) marked for deletion at the
+		 * end of the line. We must do this now in two ways :
+		 *  - if some cookies must be preserved, we only delete from the
+		 *    mark to the end of line ;
+		 *  - if nothing needs to be preserved, simply delete the whole header
 		 */
-		if (del_cookie != NULL) {
+		if (del_from) {
 			int delta;
-			if (app_cookies) {
-				delta = buffer_replace2(req, del_colon, cur_end, NULL, 0);
-				cur_end = del_colon;
+			if (preserve_hdr) {
+				delta = del_hdr_value(req, &del_from, hdr_end);
+				hdr_end = del_from;
 				cur_hdr->len += delta;
 			} else {
-				delta = buffer_replace2(req, cur_ptr, cur_next, NULL, 0);
+				delta = buffer_replace2(req, hdr_beg, hdr_next, NULL, 0);
 
 				/* FIXME: this should be a separate function */
 				txn->hdr_idx.v[old_idx].next = cur_hdr->next;
 				txn->hdr_idx.used--;
 				cur_hdr->len = 0;
+				cur_idx = old_idx;
 			}
-			cur_next += delta;
+			hdr_next += delta;
 			http_msg_move_end(&txn->req, delta);
 		}
 
-		/* keep the link from this header to next one */
+		/* check next header */
 		old_idx = cur_idx;
-	} /* end of cookie processing on this header */
+	}
 }
 
 
@@ -5934,6 +6598,7 @@ int apply_filter_to_resp_headers(struct session *t, struct buffer *rtr, struct h
 				txn->hdr_idx.used--;
 				cur_hdr->len = 0;
 				cur_end = NULL; /* null-term has been rewritten */
+				cur_idx = old_idx;
 				break;
 
 			}
@@ -6089,148 +6754,289 @@ int apply_filters_to_response(struct session *s, struct buffer *rtr, struct prox
 }
 
 
-
 /*
  * Manage server-side cookies. It can impact performance by about 2% so it is
- * desirable to call it only when needed.
+ * desirable to call it only when needed. This function is also used when we
+ * just need to know if there is a cookie (eg: for check-cache).
  */
-void manage_server_side_cookies(struct session *t, struct buffer *rtr)
+void manage_server_side_cookies(struct session *t, struct buffer *res)
 {
 	struct http_txn *txn = &t->txn;
-	char *p1, *p2, *p3, *p4;
-
-	char *cur_ptr, *cur_end, *cur_next;
+	int is_cookie2;
 	int cur_idx, old_idx, delta;
+	char *hdr_beg, *hdr_end, *hdr_next;
+	char *prev, *att_beg, *att_end, *equal, *val_beg, *val_end, *next;
 
 	/* Iterate through the headers.
 	 * we start with the start line.
 	 */
 	old_idx = 0;
-	cur_next = txn->rsp.sol + hdr_idx_first_pos(&txn->hdr_idx);
+	hdr_next = txn->rsp.sol + hdr_idx_first_pos(&txn->hdr_idx);
 
 	while ((cur_idx = txn->hdr_idx.v[old_idx].next)) {
 		struct hdr_idx_elem *cur_hdr;
 		int val;
 
 		cur_hdr  = &txn->hdr_idx.v[cur_idx];
-		cur_ptr  = cur_next;
-		cur_end  = cur_ptr + cur_hdr->len;
-		cur_next = cur_end + cur_hdr->cr + 1;
+		hdr_beg  = hdr_next;
+		hdr_end  = hdr_beg + cur_hdr->len;
+		hdr_next = hdr_end + cur_hdr->cr + 1;
 
-		/* We have one full header between cur_ptr and cur_end, and the
-		 * next header starts at cur_next. We're only interested in
-		 * "Cookie:" headers.
+		/* We have one full header between hdr_beg and hdr_end, and the
+		 * next header starts at hdr_next. We're only interested in
+		 * "Set-Cookie" and "Set-Cookie2" headers.
 		 */
 
-		val = http_header_match2(cur_ptr, cur_end, "Set-Cookie", 10);
+		is_cookie2 = 0;
+		prev = hdr_beg + 10;
+		val = http_header_match2(hdr_beg, hdr_end, "Set-Cookie", 10);
 		if (!val) {
-			old_idx = cur_idx;
-			continue;
+			val = http_header_match2(hdr_beg, hdr_end, "Set-Cookie2", 11);
+			if (!val) {
+				old_idx = cur_idx;
+				continue;
+			}
+			is_cookie2 = 1;
+			prev = hdr_beg + 11;
 		}
 
-		/* OK, right now we know we have a set-cookie at cur_ptr */
-		txn->flags |= TX_SCK_ANY;
+		/* OK, right now we know we have a Set-Cookie* at hdr_beg, and
+		 * <prev> points to the colon.
+		 */
+		txn->flags |= TX_SCK_PRESENT;
 
-
-		/* maybe we only wanted to see if there was a set-cookie. Note that
-		 * the cookie capture is declared in the fronend.
+		/* Maybe we only wanted to see if there was a Set-Cookie (eg:
+		 * check-cache is enabled) and we are not interested in checking
+		 * them. Warning, the cookie capture is declared in the frontend.
 		 */
 		if (t->be->cookie_name == NULL &&
 		    t->be->appsession_name == NULL &&
 		    t->fe->capture_name == NULL)
 			return;
 
-		p1 = cur_ptr + val; /* first non-space char after 'Set-Cookie:' */
-		
-		while (p1 < cur_end) { /* in fact, we'll break after the first cookie */
-			if (p1 == cur_end || *p1 == ';') /* end of cookie */
-				break;
+		/* OK so now we know we have to process this response cookie.
+		 * The format of the Set-Cookie header is slightly different
+		 * from the format of the Cookie header in that it does not
+		 * support the comma as a cookie delimiter (thus the header
+		 * cannot be folded) because the Expires attribute described in
+		 * the original Netscape's spec may contain an unquoted date
+		 * with a comma inside. We have to live with this because
+		 * many browsers don't support Max-Age and some browsers don't
+		 * support quoted strings. However the Set-Cookie2 header is
+		 * clean.
+		 *
+		 * We have to keep multiple pointers in order to support cookie
+		 * removal at the beginning, middle or end of header without
+		 * corrupting the header (in case of set-cookie2). A special
+		 * pointer, <scav> points to the beginning of the set-cookie-av
+		 * fields after the first semi-colon. The <next> pointer points
+		 * either to the end of line (set-cookie) or next unquoted comma
+		 * (set-cookie2). All of these headers are valid :
+		 *
+		 * Set-Cookie:    NAME1  =  VALUE 1  ; Secure; Path="/"\r\n
+		 * Set-Cookie:NAME=VALUE; Secure; Expires=Thu, 01-Jan-1970 00:00:01 GMT\r\n
+		 * Set-Cookie: NAME = VALUE ; Secure; Expires=Thu, 01-Jan-1970 00:00:01 GMT\r\n
+		 * Set-Cookie2: NAME1 = VALUE 1 ; Max-Age=0, NAME2=VALUE2; Discard\r\n
+		 * |          | |   | | |     | |          |                      |
+		 * |          | |   | | |     | |          +-> next    hdr_end <--+
+		 * |          | |   | | |     | +------------> scav
+		 * |          | |   | | |     +--------------> val_end
+		 * |          | |   | | +--------------------> val_beg
+		 * |          | |   | +----------------------> equal
+		 * |          | |   +------------------------> att_end
+		 * |          | +----------------------------> att_beg
+		 * |          +------------------------------> prev
+		 * +-----------------------------------------> hdr_beg
+		 */
 
-			/* p1 is at the beginning of the cookie name */
-			p2 = p1;
+		for (; prev < hdr_end; prev = next) {
+			/* Iterate through all cookies on this line */
 
-			while (p2 < cur_end && *p2 != '=' && *p2 != ';')
-				p2++;
+			/* find att_beg */
+			att_beg = prev + 1;
+			while (att_beg < hdr_end && http_is_spht[(unsigned char)*att_beg])
+				att_beg++;
 
-			if (p2 == cur_end || *p2 == ';') /* next cookie */
-				break;
+			/* find att_end : this is the first character after the last non
+			 * space before the equal. It may be equal to hdr_end.
+			 */
+			equal = att_end = att_beg;
 
-			p3 = p2 + 1; /* skip the '=' sign */
-			if (p3 == cur_end)
-				break;
+			while (equal < hdr_end) {
+				if (*equal == '=' || *equal == ';' || (is_cookie2 && *equal == ','))
+					break;
+				if (http_is_spht[(unsigned char)*equal++])
+					continue;
+				att_end = equal;
+			}
 
-			p4 = p3;
-			while (p4 < cur_end && !isspace((unsigned char)*p4) && *p4 != ';')
-				p4++;
-
-			/* here, we have the cookie name between p1 and p2,
-			 * and its value between p3 and p4.
-			 * we can process it.
+			/* here, <equal> points to '=', a delimitor or the end. <att_end>
+			 * is between <att_beg> and <equal>, both may be identical.
 			 */
 
-			/* first, let's see if we want to capture it */
+			/* look for end of cookie if there is an equal sign */
+			if (equal < hdr_end && *equal == '=') {
+				/* look for the beginning of the value */
+				val_beg = equal + 1;
+				while (val_beg < hdr_end && http_is_spht[(unsigned char)*val_beg])
+					val_beg++;
+
+				/* find the end of the value, respecting quotes */
+				next = find_cookie_value_end(val_beg, hdr_end);
+
+				/* make val_end point to the first white space or delimitor after the value */
+				val_end = next;
+				while (val_end > val_beg && http_is_spht[(unsigned char)*(val_end - 1)])
+					val_end--;
+			} else {
+				/* <equal> points to next comma, semi-colon or EOL */
+				val_beg = val_end = next = equal;
+			}
+
+			if (next < hdr_end) {
+				/* Set-Cookie2 supports multiple cookies, and <next> points to
+				 * a colon or semi-colon before the end. So skip all attr-value
+				 * pairs and look for the next comma. For Set-Cookie, since
+				 * commas are permitted in values, skip to the end.
+				 */
+				if (is_cookie2)
+					next = find_hdr_value_end(next, hdr_end);
+				else
+					next = hdr_end;
+			}
+
+			/* Now everything is as on the diagram above */
+
+			/* Ignore cookies with no equal sign */
+			if (equal == val_end)
+				continue;
+
+			/* If there are spaces around the equal sign, we need to
+			 * strip them otherwise we'll get trouble for cookie captures,
+			 * or even for rewrites. Since this happens extremely rarely,
+			 * it does not hurt performance.
+			 */
+			if (unlikely(att_end != equal || val_beg > equal + 1)) {
+				int stripped_before = 0;
+				int stripped_after = 0;
+
+				if (att_end != equal) {
+					stripped_before = buffer_replace2(res, att_end, equal, NULL, 0);
+					equal   += stripped_before;
+					val_beg += stripped_before;
+				}
+
+				if (val_beg > equal + 1) {
+					stripped_after = buffer_replace2(res, equal + 1, val_beg, NULL, 0);
+					val_beg += stripped_after;
+					stripped_before += stripped_after;
+				}
+
+				val_end      += stripped_before;
+				next         += stripped_before;
+				hdr_end      += stripped_before;
+				hdr_next     += stripped_before;
+				cur_hdr->len += stripped_before;
+				http_msg_move_end(&txn->rsp, stripped_before);
+			}
+
+			/* First, let's see if we want to capture this cookie. We check
+			 * that we don't already have a server side cookie, because we
+			 * can only capture one. Also as an optimisation, we ignore
+			 * cookies shorter than the declared name.
+			 */
 			if (t->fe->capture_name != NULL &&
 			    txn->srv_cookie == NULL &&
-			    (p4 - p1 >= t->fe->capture_namelen) &&
-			    memcmp(p1, t->fe->capture_name, t->fe->capture_namelen) == 0) {
-				int log_len = p4 - p1;
-
+			    (val_end - att_beg >= t->fe->capture_namelen) &&
+			    memcmp(att_beg, t->fe->capture_name, t->fe->capture_namelen) == 0) {
+				int log_len = val_end - att_beg;
 				if ((txn->srv_cookie = pool_alloc2(pool2_capture)) == NULL) {
 					Alert("HTTP logging : out of memory.\n");
 				}
-
-				if (log_len > t->fe->capture_len)
-					log_len = t->fe->capture_len;
-				memcpy(txn->srv_cookie, p1, log_len);
-				txn->srv_cookie[log_len] = 0;
+				else {
+					if (log_len > t->fe->capture_len)
+						log_len = t->fe->capture_len;
+					memcpy(txn->srv_cookie, att_beg, log_len);
+					txn->srv_cookie[log_len] = 0;
+				}
 			}
 
 			/* now check if we need to process it for persistence */
-			if (!(t->flags & SN_IGNORE_PRST) && (p2 - p1 == t->be->cookie_len) && (t->be->cookie_name != NULL) &&
-			    (memcmp(p1, t->be->cookie_name, p2 - p1) == 0)) {
-				/* Cool... it's the right one */
-				txn->flags |= TX_SCK_SEEN;
+			if (!(t->flags & SN_IGNORE_PRST) &&
+			    (att_end - att_beg == t->be->cookie_len) && (t->be->cookie_name != NULL) &&
+			    (memcmp(att_beg, t->be->cookie_name, att_end - att_beg) == 0)) {
+				/* assume passive cookie by default */
+				txn->flags &= ~TX_SCK_MASK;
+				txn->flags |= TX_SCK_FOUND;
 			
 				/* If the cookie is in insert mode on a known server, we'll delete
 				 * this occurrence because we'll insert another one later.
 				 * We'll delete it too if the "indirect" option is set and we're in
-				 * a direct access. */
-				if (((t->srv) && (t->be->options & PR_O_COOK_INS)) ||
+				 * a direct access.
+				 */
+				if (t->be->options2 & PR_O2_COOK_PSV) {
+					/* The "preserve" flag was set, we don't want to touch the
+					 * server's cookie.
+					 */
+				}
+				else if (((t->srv) && (t->be->options & PR_O_COOK_INS)) ||
 				    ((t->flags & SN_DIRECT) && (t->be->options & PR_O_COOK_IND))) {
-					/* this header must be deleted */
-					delta = buffer_replace2(rtr, cur_ptr, cur_next, NULL, 0);
-					txn->hdr_idx.v[old_idx].next = cur_hdr->next;
-					txn->hdr_idx.used--;
-					cur_hdr->len = 0;
-					cur_next += delta;
-					http_msg_move_end(&txn->rsp, delta);
-
+					/* this cookie must be deleted */
+					if (*prev == ':' && next == hdr_end) {
+						/* whole header */
+						delta = buffer_replace2(res, hdr_beg, hdr_next, NULL, 0);
+						txn->hdr_idx.v[old_idx].next = cur_hdr->next;
+						txn->hdr_idx.used--;
+						cur_hdr->len = 0;
+						cur_idx = old_idx;
+						hdr_next += delta;
+						http_msg_move_end(&txn->rsp, delta);
+						/* note: while both invalid now, <next> and <hdr_end>
+						 * are still equal, so the for() will stop as expected.
+						 */
+					} else {
+						/* just remove the value */
+						int delta = del_hdr_value(res, &prev, next);
+						next      = prev;
+						hdr_end  += delta;
+						hdr_next += delta;
+						cur_hdr->len += delta;
+						http_msg_move_end(&txn->rsp, delta);
+					}
+					txn->flags &= ~TX_SCK_MASK;
 					txn->flags |= TX_SCK_DELETED;
+					/* and go on with next cookie */
 				}
 				else if ((t->srv) && (t->srv->cookie) &&
 					 (t->be->options & PR_O_COOK_RW)) {
-					/* replace bytes p3->p4 with the cookie name associated
+					/* replace bytes val_beg->val_end with the cookie name associated
 					 * with this server since we know it.
 					 */
-					delta = buffer_replace2(rtr, p3, p4, t->srv->cookie, t->srv->cklen);
+					delta = buffer_replace2(res, val_beg, val_end, t->srv->cookie, t->srv->cklen);
+					next     += delta;
+					hdr_end  += delta;
+					hdr_next += delta;
 					cur_hdr->len += delta;
-					cur_next += delta;
 					http_msg_move_end(&txn->rsp, delta);
 
-					txn->flags |= TX_SCK_INSERTED | TX_SCK_DELETED;
+					txn->flags &= ~TX_SCK_MASK;
+					txn->flags |= TX_SCK_REPLACED;
 				}
 				else if ((t->srv) && (t->srv->cookie) &&
 					 (t->be->options & PR_O_COOK_PFX)) {
 					/* insert the cookie name associated with this server
-					 * before existing cookie, and insert a delimitor between them..
+					 * before existing cookie, and insert a delimiter between them..
 					 */
-					delta = buffer_replace2(rtr, p3, p3, t->srv->cookie, t->srv->cklen + 1);
+					delta = buffer_replace2(res, val_beg, val_beg, t->srv->cookie, t->srv->cklen + 1);
+					next     += delta;
+					hdr_end  += delta;
+					hdr_next += delta;
 					cur_hdr->len += delta;
-					cur_next += delta;
 					http_msg_move_end(&txn->rsp, delta);
 
-					p3[t->srv->cklen] = COOKIE_DELIM;
-					txn->flags |= TX_SCK_INSERTED | TX_SCK_DELETED;
+					val_beg[t->srv->cklen] = COOKIE_DELIM;
+					txn->flags &= ~TX_SCK_MASK;
+					txn->flags |= TX_SCK_REPLACED;
 				}
 			}
 			/* next, let's see if the cookie is our appcookie, unless persistence must be ignored */
@@ -6239,22 +7045,20 @@ void manage_server_side_cookies(struct session *t, struct buffer *rtr)
 				char *value_begin;
 
 				if (t->be->options2 & PR_O2_AS_PFX) {
-					cmp_len = MIN(p4 - p1, t->be->appsession_name_len);
-					value_begin = p1 + t->be->appsession_name_len;
-					value_len = MIN(t->be->appsession_len, p4 - p1 - t->be->appsession_name_len);
+					cmp_len = MIN(val_end - att_beg, t->be->appsession_name_len);
+					value_begin = att_beg + t->be->appsession_name_len;
+					value_len = MIN(t->be->appsession_len, val_end - att_beg - t->be->appsession_name_len);
 				} else {
-					cmp_len = p2 - p1;
-					value_begin = p3;
-					value_len = MIN(t->be->appsession_len, p4 - p3);
+					cmp_len = att_end - att_beg;
+					value_begin = val_beg;
+					value_len = MIN(t->be->appsession_len, val_end - val_beg);
 				}
 
 				if ((cmp_len == t->be->appsession_name_len) &&
-				    (memcmp(p1, t->be->appsession_name, t->be->appsession_name_len) == 0)) {
-					/* Cool... it's the right one */
-					if (txn->sessid != NULL) {
-						/* free previously allocated memory as we don't need it anymore */
-						pool_free2(apools.sessid, txn->sessid);
-					}
+				    (memcmp(att_beg, t->be->appsession_name, t->be->appsession_name_len) == 0)) {
+					/* free a possibly previously allocated memory */
+					pool_free2(apools.sessid, txn->sessid);
+
 					/* Store the sessid in the session for future use */
 					if ((txn->sessid = pool_alloc2(apools.sessid)) == NULL) {
 						Alert("Not enough Memory process_srv():asession->sessid:malloc().\n");
@@ -6264,12 +7068,14 @@ void manage_server_side_cookies(struct session *t, struct buffer *rtr)
 					memcpy(txn->sessid, value_begin, value_len);
 					txn->sessid[value_len] = 0;
 				}
-			} /* end if ((t->be->appsession_name != NULL) ... */
-			break; /* we don't want to loop again since there cannot be another cookie on the same line */
-		} /* we're now at the end of the cookie value */
-		/* keep the link from this header to next one */
+			}
+			/* that's done for this cookie, check the next one on the same
+			 * line when next != hdr_end (only if is_cookie2).
+			 */
+		}
+		/* check next header */
 		old_idx = cur_idx;
-	} /* end of cookie processing on this header */
+	}
 
 	if (txn->sessid != NULL) {
 		appsess *asession = NULL;
@@ -6282,6 +7088,8 @@ void manage_server_side_cookies(struct session *t, struct buffer *rtr)
 				send_log(t->be, LOG_ALERT, "Not enough Memory process_srv():asession:calloc().\n");
 				return;
 			}
+			asession->serverid = NULL; /* to avoid a double free in case of allocation error */
+
 			if ((asession->sessid = pool_alloc2(apools.sessid)) == NULL) {
 				Alert("Not enough Memory process_srv():asession->sessid:malloc().\n");
 				send_log(t->be, LOG_ALERT, "Not enough Memory process_srv():asession->sessid:malloc().\n");
@@ -6293,7 +7101,7 @@ void manage_server_side_cookies(struct session *t, struct buffer *rtr)
 
 			server_id_len = strlen(t->srv->id) + 1;
 			if ((asession->serverid = pool_alloc2(apools.serverid)) == NULL) {
-				Alert("Not enough Memory process_srv():asession->sessid:malloc().\n");
+				Alert("Not enough Memory process_srv():asession->serverid:malloc().\n");
 				send_log(t->be, LOG_ALERT, "Not enough Memory process_srv():asession->sessid:malloc().\n");
 				t->be->htbl_proxy.destroy(asession);
 				return;
@@ -6308,15 +7116,7 @@ void manage_server_side_cookies(struct session *t, struct buffer *rtr)
 		asession->expire = tick_add_ifset(now_ms, t->be->timeout.appsession);
 		asession->request_count++;
 	}
-
-#if defined(DEBUG_HASH)
-	if (t->be->appsession_name) {
-		Alert("manage_server_side_cookies\n");
-		appsession_hash_dump(&(t->be->htbl_proxy));
-	}
-#endif
 }
-
 
 
 /*
@@ -6479,10 +7279,10 @@ void get_srv_from_appsession(struct session *t, const char *begin, int len)
 }
 
 /*
- * In a GET or HEAD request, check if the requested URI matches the stats uri
+ * In a GET, HEAD or POST request, check if the requested URI matches the stats uri
  * for the current backend.
  *
- * It is assumed that the request is either a HEAD or GET and that the
+ * It is assumed that the request is either a HEAD, GET, or POST and that the
  * t->be->uri_auth field is valid.
  *
  * Returns 1 if stats should be provided, otherwise 0.
@@ -6496,7 +7296,7 @@ int stats_check_uri(struct session *t, struct proxy *backend)
 	if (!uri_auth)
 		return 0;
 
-	if (txn->meth != HTTP_METH_GET && txn->meth != HTTP_METH_HEAD)
+	if (txn->meth != HTTP_METH_GET && txn->meth != HTTP_METH_HEAD && txn->meth != HTTP_METH_POST)
 		return 0;
 
 	memset(&t->data_ctx.stats, 0, sizeof(t->data_ctx.stats));
@@ -6540,6 +7340,26 @@ int stats_check_uri(struct session *t, struct proxy *backend)
 		h++;
 	}
 
+	h = txn->req.sol + txn->req.sl.rq.u + uri_auth->uri_len;
+	while (h <= txn->req.sol + txn->req.sl.rq.u + txn->req.sl.rq.u_l - 8) {
+		if (memcmp(h, ";st=", 4) == 0) {
+			h += 4;
+
+			if (memcmp(h, STAT_STATUS_DONE, 4) == 0)
+				t->data_ctx.stats.st_code = STAT_STATUS_DONE;
+			else if (memcmp(h, STAT_STATUS_NONE, 4) == 0)
+				t->data_ctx.stats.st_code = STAT_STATUS_NONE;
+			else if (memcmp(h, STAT_STATUS_EXCD, 4) == 0)
+				t->data_ctx.stats.st_code = STAT_STATUS_EXCD;
+			else if (memcmp(h, STAT_STATUS_DENY, 4) == 0)
+				t->data_ctx.stats.st_code = STAT_STATUS_DENY;
+			else
+				t->data_ctx.stats.st_code = STAT_STATUS_UNKN;
+			break;
+		}
+		h++;
+	}
+
 	t->data_ctx.stats.flags |= STAT_SHOW_STAT | STAT_SHOW_INFO;
 
 	return 1;
@@ -6552,19 +7372,35 @@ int stats_check_uri(struct session *t, struct proxy *backend)
  */
 void http_capture_bad_message(struct error_snapshot *es, struct session *s,
                               struct buffer *buf, struct http_msg *msg,
-			      struct proxy *other_end)
+			      int state, struct proxy *other_end)
 {
-	es->len = buf->r - (buf->data + msg->som);
-	memcpy(es->buf, buf->data + msg->som, MIN(es->len, sizeof(es->buf)));
+	if (buf->r <= (buf->data + msg->som)) { /* message wraps */
+		int len1 = buf->size - msg->som;
+		es->len = buf->r - (buf->data + msg->som) + buf->size;
+		memcpy(es->buf, buf->data + msg->som, MIN(len1, sizeof(es->buf)));
+		if (es->len > len1 && len1 < sizeof(es->buf))
+			memcpy(es->buf, buf->data, MIN(es->len, sizeof(es->buf)) - len1);
+	}
+	else {
+		es->len = buf->r - (buf->data + msg->som);
+		memcpy(es->buf, buf->data + msg->som, MIN(es->len, sizeof(es->buf)));
+	}
+
 	if (msg->err_pos >= 0)
 		es->pos  = msg->err_pos - msg->som;
-	else
+	else if (buf->lr >= (buf->data + msg->som))
 		es->pos  = buf->lr - (buf->data + msg->som);
+	else
+		es->pos  = buf->lr - (buf->data + msg->som) + buf->size;
+
 	es->when = date; // user-visible date
 	es->sid  = s->uniq_id;
 	es->srv  = s->srv;
 	es->oe   = other_end;
 	es->src  = s->cli_addr;
+	es->state = state;
+	es->flags = buf->flags;
+	es->ev_id = error_snapshot_id++;
 }
 
 /* return the IP address pointed to by occurrence <occ> of header <hname> in
@@ -6648,12 +7484,17 @@ void http_init_txn(struct session *s)
 	txn->flags = 0;
 	txn->status = -1;
 
+	txn->cookie_first_date = 0;
+	txn->cookie_last_date = 0;
+
 	txn->req.sol = txn->req.eol = NULL;
 	txn->req.som = txn->req.eoh = 0; /* relative to the buffer */
 	txn->rsp.sol = txn->rsp.eol = NULL;
 	txn->rsp.som = txn->rsp.eoh = 0; /* relative to the buffer */
-	txn->req.hdr_content_len = 0LL;
-	txn->rsp.hdr_content_len = 0LL;
+	txn->req.chunk_len = 0LL;
+	txn->req.body_len = 0LL;
+	txn->rsp.chunk_len = 0LL;
+	txn->rsp.body_len = 0LL;
 	txn->req.msg_state = HTTP_MSG_RQBEFORE; /* at the very beginning of the request */
 	txn->rsp.msg_state = HTTP_MSG_RPBEFORE; /* at the very beginning of the response */
 
@@ -7350,6 +8191,22 @@ acl_fetch_proto_http(struct proxy *px, struct session *s, void *l7, int dir,
 	return 1;
 }
 
+/* return a valid test if the current request is the first one on the connection */
+static int
+acl_fetch_http_first_req(struct proxy *px, struct session *s, void *l7, int dir,
+		     struct acl_expr *expr, struct acl_test *test)
+{
+	if (!s)
+		return 0;
+
+	if (s->txn.flags & TX_NOT_FIRST)
+		test->flags |= ACL_TEST_F_SET_RES_FAIL;
+	else
+		test->flags |= ACL_TEST_F_SET_RES_PASS;
+
+	return 1;
+}
+
 static int
 acl_fetch_http_auth(struct proxy *px, struct session *s, void *l7, int dir,
 		    struct acl_expr *expr, struct acl_test *test)
@@ -7390,6 +8247,7 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "url_dir",    acl_parse_str,   acl_fetch_url,      acl_match_dir,  ACL_USE_L7REQ_VOLATILE },
 	{ "url_dom",    acl_parse_str,   acl_fetch_url,      acl_match_dom,  ACL_USE_L7REQ_VOLATILE },
 	{ "url_reg",    acl_parse_reg,   acl_fetch_url,      acl_match_reg,  ACL_USE_L7REQ_VOLATILE },
+	{ "url_len",    acl_parse_int,   acl_fetch_url,      acl_match_len,  ACL_USE_L7REQ_VOLATILE },
 	{ "url_ip",     acl_parse_ip,    acl_fetch_url_ip,   acl_match_ip,   ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP },
 	{ "url_port",   acl_parse_int,   acl_fetch_url_port, acl_match_int,  ACL_USE_L7REQ_VOLATILE },
 
@@ -7402,6 +8260,7 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "hdr_dir",    acl_parse_str,   acl_fetch_chdr,    acl_match_dir, ACL_USE_L7REQ_VOLATILE },
 	{ "hdr_dom",    acl_parse_str,   acl_fetch_chdr,    acl_match_dom, ACL_USE_L7REQ_VOLATILE },
 	{ "hdr_cnt",    acl_parse_int,   acl_fetch_chdr_cnt,acl_match_int, ACL_USE_L7REQ_VOLATILE },
+	{ "hdr_len",    acl_parse_int,   acl_fetch_chdr,    acl_match_len, ACL_USE_L7REQ_VOLATILE },
 	{ "hdr_val",    acl_parse_int,   acl_fetch_chdr_val,acl_match_int, ACL_USE_L7REQ_VOLATILE },
 	{ "hdr_ip",     acl_parse_ip,    acl_fetch_chdr_ip, acl_match_ip,  ACL_USE_L7REQ_VOLATILE|ACL_MAY_LOOKUP },
 
@@ -7413,6 +8272,7 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "shdr_dir",   acl_parse_str,   acl_fetch_shdr,    acl_match_dir, ACL_USE_L7RTR_VOLATILE },
 	{ "shdr_dom",   acl_parse_str,   acl_fetch_shdr,    acl_match_dom, ACL_USE_L7RTR_VOLATILE },
 	{ "shdr_cnt",   acl_parse_int,   acl_fetch_shdr_cnt,acl_match_int, ACL_USE_L7RTR_VOLATILE },
+	{ "shdr_len",   acl_parse_int,   acl_fetch_shdr,    acl_match_len, ACL_USE_L7RTR_VOLATILE },
 	{ "shdr_val",   acl_parse_int,   acl_fetch_shdr_val,acl_match_int, ACL_USE_L7RTR_VOLATILE },
 	{ "shdr_ip",    acl_parse_ip,    acl_fetch_shdr_ip, acl_match_ip,  ACL_USE_L7RTR_VOLATILE|ACL_MAY_LOOKUP },
 
@@ -7423,6 +8283,7 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "path_sub",   acl_parse_str,   acl_fetch_path,   acl_match_sub, ACL_USE_L7REQ_VOLATILE },
 	{ "path_dir",   acl_parse_str,   acl_fetch_path,   acl_match_dir, ACL_USE_L7REQ_VOLATILE },
 	{ "path_dom",   acl_parse_str,   acl_fetch_path,   acl_match_dom, ACL_USE_L7REQ_VOLATILE },
+	{ "path_len",   acl_parse_int,   acl_fetch_path,   acl_match_len, ACL_USE_L7REQ_VOLATILE },
 
 #if 0
 	{ "line",       acl_parse_str,   acl_fetch_line,   acl_match_str   },
@@ -7443,8 +8304,9 @@ static struct acl_kw_list acl_kws = {{ },{
 	{ "cook_pst",   acl_parse_none,  acl_fetch_cook,   acl_match_pst   },
 #endif
 
-	{ "http_auth",       acl_parse_nothing, acl_fetch_http_auth, acl_match_auth },
-	{ "http_auth_group", acl_parse_strcat,  acl_fetch_http_auth, acl_match_auth },
+	{ "http_auth",       acl_parse_nothing, acl_fetch_http_auth, acl_match_auth, ACL_USE_L7REQ_PERMANENT },
+	{ "http_auth_group", acl_parse_strcat,  acl_fetch_http_auth, acl_match_auth, ACL_USE_L7REQ_PERMANENT },
+	{ "http_first_req",  acl_parse_nothing, acl_fetch_http_first_req, acl_match_nothing, ACL_USE_L7REQ_PERMANENT },
 	{ NULL, NULL, NULL, NULL },
 }};
 

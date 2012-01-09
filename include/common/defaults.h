@@ -97,6 +97,12 @@
 #define MIN_RET_FOR_READ_LOOP 1460
 #endif
 
+// The minimum number of bytes to be forwarded that is worth trying to splice.
+// Below 4kB, it's not worth allocating pipes nor pretending to zero-copy.
+#ifndef MIN_SPLICE_FORWARD
+#define MIN_SPLICE_FORWARD 4096
+#endif
+
 // the max number of events returned in one call to poll/epoll. Too small a
 // value will cause lots of calls, and too high a value may cause high latency.
 #ifndef MAX_POLL_EVENTS
@@ -110,6 +116,12 @@
 #define COOKIE_DELIM    '~'
 #endif
 
+// this delimitor is used between a server's name and a last visit date in
+// cookies exchanged with the client.
+#ifndef COOKIE_DELIM_DATE
+#define COOKIE_DELIM_DATE       '|'
+#endif
+
 #define CONN_RETRIES    3
 
 #define	CHK_CONNTIME    2000
@@ -118,6 +130,7 @@
 #define DEF_RISETIME    2
 #define DEF_CHECK_REQ   "OPTIONS / HTTP/1.0\r\n"
 #define DEF_SMTP_CHECK_REQ   "HELO localhost\r\n"
+#define DEF_LDAP_CHECK_REQ   "\x30\x0c\x02\x01\x01\x60\x07\x02\x01\x03\x04\x00\x80\x00"
 
 #define DEF_HANA_ONERR		HANA_ONERR_FAILCHK
 #define DEF_HANA_ERRLIMIT	10

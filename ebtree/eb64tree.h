@@ -125,7 +125,6 @@ static forceinline struct eb64_node *__eb64_lookup(struct eb_root *root, u64 x)
 	struct eb64_node *node;
 	eb_troot_t *troot;
 	u64 y;
-	int node_bit;
 
 	troot = root->b[EB_LEFT];
 	if (unlikely(troot == NULL))
@@ -142,7 +141,6 @@ static forceinline struct eb64_node *__eb64_lookup(struct eb_root *root, u64 x)
 		}
 		node = container_of(eb_untag(troot, EB_NODE),
 				    struct eb64_node, node.branches);
-		node_bit = node->node.bit;
 
 		y = node->key ^ x;
 		if (!y) {
@@ -177,7 +175,6 @@ static forceinline struct eb64_node *__eb64i_lookup(struct eb_root *root, s64 x)
 	eb_troot_t *troot;
 	u64 key = x ^ (1ULL << 63);
 	u64 y;
-	int node_bit;
 
 	troot = root->b[EB_LEFT];
 	if (unlikely(troot == NULL))
@@ -194,7 +191,6 @@ static forceinline struct eb64_node *__eb64i_lookup(struct eb_root *root, s64 x)
 		}
 		node = container_of(eb_untag(troot, EB_NODE),
 				    struct eb64_node, node.branches);
-		node_bit = node->node.bit;
 
 		y = node->key ^ x;
 		if (!y) {
@@ -229,7 +225,7 @@ __eb64_insert(struct eb_root *root, struct eb64_node *new) {
 	unsigned int side;
 	eb_troot_t *troot;
 	u64 newkey; /* caching the key saves approximately one cycle */
-	eb_troot_t *root_right = root;
+	eb_troot_t *root_right;
 	int old_node_bit;
 
 	side = EB_LEFT;
@@ -405,7 +401,7 @@ __eb64i_insert(struct eb_root *root, struct eb64_node *new) {
 	unsigned int side;
 	eb_troot_t *troot;
 	u64 newkey; /* caching the key saves approximately one cycle */
-	eb_troot_t *root_right = root;
+	eb_troot_t *root_right;
 	int old_node_bit;
 
 	side = EB_LEFT;
